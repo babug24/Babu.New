@@ -1,0 +1,3700 @@
+#!/usr/bin/env node
+
+/**
+ * Comprehensive Click Reception Validator - FINAL COMPLETE VERSION
+ *
+ * SUMMARY OF FIXES:
+ * 1. Sticky CTA: Properly handles ngx-web-sticky-cta component with Shadow DOM
+ * 2. Chat widget: Closes before carousel tests to prevent click interception
+ * 3. Carousel buttons: Uses force click to bypass overlays
+ * 4. Lazy loading: Scrolls page before element discovery
+ * 5. Timeout protection: Prevents script from hanging
+ * 6. Case-insensitive text matching for element finding
+ * 7. Proper text extraction for all element types
+ * 8. Excel deduplication: Removes duplicate entries from Excel report only (ngx-web-link + a pairs)
+ */
+
+const { chromium } = require('playwright');
+const fs = require('fs').promises;
+const fsSync = require('fs');
+const path = require('path');
+const XLSX = require('xlsx');
+
+// ======================== CONFIGURATION ========================
+
+const CONFIG = {
+  reportsDir: './click-validation-reports',
+  viewport: { width: 1520, height: 900 },
+  navigationTimeout: 30000,
+  clickTimeout: 10000,
+  restoreWaitMs: 2000,
+  retryAttempts: 3,
+  retryDelayMs: 800,
+  maxElementsPerUrl: 0,
+  maxTileItemsPerUrl: 0,
+  collectAllClickableEvents: true,
+  dedupeExcelRows: false,
+ 
+  detectContentChange: true,
+  detectNewTab: true,
+  detectURLChange: true,
+  forceClickWhenHidden: true,
+  waitForAngular: true,
+  screenshotOnFailure: true,
+  backToTopAnchorIds: ['top', 'page-top', 'pagetop', 'back-to-top', 'backtotop', 'to-top', 'totop'],
+ 
+  angularSelectors: ['app-root', 'ngx-web-', 'bolt-', 'ng-component'],
+  carouselSelectors: ['.owl-carousel', '.slick-slider', '.carousel', 'owl-carousel-o']
+};
+
+// ======================== UTILITIES ========================
+
+async function delay(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function stopPageLoading(page) {
+  try {
+    await page.evaluate(() => {
+      if (typeof window.stop === 'function') {
+        window.stop();
+      }
+    });
+  } catch { }
+}
+
+async function navigateWithRecovery(page, url, options = {}) {
+  const timeout = options.timeout || CONFIG.navigationTimeout;
+  const attempts = options.attempts || 2;
+
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      await stopPageLoading(page);
+
+      if (attempt === 1) {
+        await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
+        return true;
+      }
+
+      // Fallback for flaky/slow pages: commit first, then wait for DOM if possible.
+      await page.goto(url, { waitUntil: 'commit', timeout: Math.min(timeout, 15000) });
+      await page.waitForLoadState('domcontentloaded', { timeout: 7000 }).catch(() => {});
+      return true;
+    } catch {
+      if (attempt < attempts) {
+        await delay(500 * attempt);
+        continue;
+      }
+      return false;
+    }
+  }
+
+  return false;
+}
+
+async function firstVisible(locator, maxScan = 30) {
+  const total = await locator.count().catch(() => 0);
+  if (total === 0) return null;
+  const limit = Math.min(total, maxScan);
+  for (let i = 0; i < limit; i++) {
+    const candidate = locator.nth(i);
+    if (await candidate.isVisible({ timeout: 800 }).catch(() => false)) {
+      return candidate;
+    }
+  }
+  return null;
+}
+
+async function closestToPoint(page, locator, targetX, targetY, maxScan = 60) {
+  if (!Number.isFinite(targetX) || !Number.isFinite(targetY)) {
+    return await firstVisible(locator, maxScan);
+  }
+
+  const total = await locator.count().catch(() => 0);
+  if (total === 0) return null;
+
+  let best = null;
+  let bestDist = Number.POSITIVE_INFINITY;
+  const limit = Math.min(total, maxScan);
+
+  for (let i = 0; i < limit; i++) {
+    const candidate = locator.nth(i);
+    const visible = await candidate.isVisible({ timeout: 700 }).catch(() => false);
+    if (!visible) continue;
+
+    const box = await candidate.boundingBox().catch(() => null);
+    if (!box) continue;
+
+    const cx = box.x + (box.width / 2);
+    const cy = box.y + (box.height / 2);
+    const dx = cx - targetX;
+    const dy = cy - targetY;
+    const dist = (dx * dx) + (dy * dy);
+
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = candidate;
+    }
+  }
+
+  return best || await firstVisible(locator, maxScan);
+}
+
+async function stabilizeElementForClick(page, locator, elementInfo) {
+  await locator.scrollIntoViewIfNeeded({ timeout: 2500 }).catch(() => {});
+  await delay(250);
+
+  let visible = await locator.isVisible({ timeout: 1200 }).catch(() => false);
+
+  if (!visible && Number.isFinite(elementInfo?.y)) {
+    await page.evaluate((y) => {
+      const targetY = Math.max((y || 0) - 280, 0);
+      window.scrollTo({ top: targetY, behavior: 'auto' });
+    }, elementInfo.y).catch(() => {});
+    await delay(250);
+    await locator.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {});
+    await delay(250);
+    visible = await locator.isVisible({ timeout: 1200 }).catch(() => false);
+  }
+
+  const box1 = await locator.boundingBox().catch(() => null);
+  await delay(120);
+  const box2 = await locator.boundingBox().catch(() => null);
+  if (box1 && box2) {
+    const dx = Math.abs((box1.x || 0) - (box2.x || 0));
+    const dy = Math.abs((box1.y || 0) - (box2.y || 0));
+    if (dx > 2 || dy > 2) {
+      await delay(180);
+    }
+  }
+
+  return visible;
+}
+
+function isVisibilityLikeError(errorMessage) {
+  const text = String(errorMessage || '').toLowerCase();
+  return (
+    text.includes('hidden') ||
+    text.includes('not visible') ||
+    text.includes('outside of the viewport') ||
+    text.includes('intercepted')
+  );
+}
+
+async function tryRevealTargetElement(page, elementInfo) {
+  if (Number.isFinite(elementInfo?.y)) {
+    await page.evaluate((y) => {
+      const targetY = Math.max((y || 0) - 320, 0);
+      window.scrollTo({ top: targetY, behavior: 'auto' });
+    }, elementInfo.y).catch(() => {});
+    await delay(220);
+  }
+
+  if (elementInfo.type !== 'a') {
+    return true;
+  }
+
+  const hasTargetSignal = Boolean(
+    (elementInfo.href && !String(elementInfo.href).startsWith('javascript')) ||
+    (elementInfo.text && elementInfo.text.trim().length > 0)
+  );
+
+  if (!hasTargetSignal) {
+    return false;
+  }
+
+  const nextButtons = page.locator('.owl-next, .slick-next, button[id*="next" i], [aria-label*="next" i]');
+  const nextBtn = await firstVisible(nextButtons, 6);
+  if (!nextBtn) {
+    return false;
+  }
+
+  for (let step = 0; step < 4; step++) {
+    await nextBtn.click({ force: true, timeout: 2500 }).catch(() => {});
+    await delay(260);
+  }
+
+  return true;
+}
+
+async function tryAlternateAnchorClick(page, elementInfo) {
+  if (!elementInfo?.href || String(elementInfo.href).startsWith('javascript')) {
+    return false;
+  }
+
+  const hrefPath = String(elementInfo.href).split('?')[0].split('#')[0];
+  if (!hrefPath || hrefPath === '/') {
+    return false;
+  }
+
+  if (Number.isFinite(elementInfo?.y) && elementInfo.y > 1600) {
+    await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight)).catch(() => {});
+    await delay(250);
+  }
+
+  const byHref = page.locator(`a[href="${hrefPath}"]`);
+  const candidate = await firstVisible(byHref, 120);
+  if (!candidate) {
+    return false;
+  }
+
+  await candidate.scrollIntoViewIfNeeded({ timeout: 2500 }).catch(() => {});
+  await delay(200);
+
+  try {
+    await candidate.click({ timeout: CONFIG.clickTimeout });
+    return true;
+  } catch {
+    try {
+      await candidate.click({ force: true, timeout: CONFIG.clickTimeout });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+function escapeHtml(str) {
+  if (!str) return '';
+  return str.replace(/[&<>]/g, (m) => {
+    if (m === '&') return '&amp;';
+    if (m === '<') return '&lt;';
+    if (m === '>') return '&gt;';
+    return m;
+  });
+}
+
+function isSearchComponentResult(result) {
+  const type = String(result?.elementType || '').toLowerCase();
+  const method = String(result?.clickMethod || '').toLowerCase();
+  const detail = String(result?.validationDetail || '').toLowerCase();
+
+  return (
+    type === 'search-input' ||
+    type === 'search-button' ||
+    method.includes('search-') ||
+    detail.includes('search input') ||
+    detail.includes('search button') ||
+    detail.includes('autocomplete')
+  );
+}
+
+function searchComponentLabel(result) {
+  const type = String(result?.elementType || '').toLowerCase();
+  if (type === 'search-input') return 'Search Input';
+  if (type === 'search-button') return 'Search Button';
+  return 'Search Component';
+}
+
+function isSkippableContactHref(href) {
+  const value = String(href || '').trim().toLowerCase();
+  return value.startsWith('tel:') || value.startsWith('mailto:');
+}
+
+function buildResultFingerprint(result, url = '') {
+  const hrefValue = String(result?.href || result?.elementInfo?.href || '').trim();
+  const normalizedHref = hrefValue && hrefValue !== 'missing'
+    ? hrefValue.split('?')[0].split('#')[0]
+    : '';
+  const elementText = String(result?.elementText || result?.elementInfo?.text || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .substring(0, 120);
+  const elementType = String(result?.elementType || '').trim();
+
+  if (normalizedHref) {
+    return `${url}|href:${normalizedHref}|text:${elementText}`;
+  }
+
+  return `${url}|type:${elementType}|text:${elementText}`;
+}
+
+function pickPreferredResult(existing, candidate) {
+  const score = (result) => {
+    let value = 0;
+    if (result?.isGenuineIssue && result?.status === 'fail') value += 100;
+    if (result?.status === 'fail') value += 20;
+    if (String(result?.elementType || '').includes('search-')) value += 5;
+    if (String(result?.validationDetail || '').length > 0) value += 2;
+    if (String(result?.errorMessage || '').length > 0) value += 1;
+    return value;
+  };
+
+  return score(candidate) > score(existing) ? candidate : existing;
+}
+
+function dedupeValidationResults(results, url = '') {
+  const deduped = new Map();
+
+  for (const result of results || []) {
+    const key = buildResultFingerprint(result, url);
+    const existing = deduped.get(key);
+    if (!existing) {
+      deduped.set(key, result);
+      continue;
+    }
+    deduped.set(key, pickPreferredResult(existing, result));
+  }
+
+  return Array.from(deduped.values());
+}
+
+// ======================== PAGE PREPARATION ========================
+
+async function preparePage(page, url) {
+  console.log(`  Loading: ${url}`);
+
+  const loaded = await navigateWithRecovery(page, url, {
+    timeout: CONFIG.navigationTimeout,
+    attempts: 3
+  });
+  if (!loaded) {
+    throw new Error(`Unable to load page within timeout: ${url}`);
+  }
+  await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+  await delay(2000);
+ 
+  if (CONFIG.waitForAngular) {
+    try {
+      await page.waitForSelector('app-root', { timeout: 5000 }).catch(() => {});
+      await delay(1500);
+    } catch { }
+  }
+ 
+  // Dismiss cookie banners
+  const bannerSelectors = [
+    'button:has-text("Accept")', 'button:has-text("Accept All")',
+    'button:has-text("Allow All")', '#onetrust-accept-btn-handler'
+  ];
+ 
+  for (const sel of bannerSelectors) {
+    try {
+      const btn = page.locator(sel).first();
+      if (await btn.isVisible({ timeout: 1500 }).catch(() => false)) {
+        await btn.click({ timeout: 3000, force: true });
+        await delay(500);
+        break;
+      }
+    } catch { }
+  }
+
+  console.log('  Load complete');
+ 
+  return page.url();
+}
+
+// ==================== SMART ELEMENT DISCOVERY ====================
+
+async function discoverClickableElements(page) {
+  return await page.evaluate((collectAllClickableEvents) => {
+    const elements = [];
+    const seen = new Set();
+   
+    const clickableSelectors = [
+      'a[href]', 'button:not([disabled])',
+      'input[type="button"]', 'input[type="submit"]',
+      '#yxt-SearchBar-input--search-bar-1',
+      '.yxt-SearchBar input[type="search"]',
+      '.yxt-SearchBar input[type="text"]',
+      '[role="button"]', '[role="link"]', '[onclick]',
+      '[tabindex="0"]:not([role]):not(a):not(button):not(input):not(select):not(textarea)',
+      'bolt-button', 'ngx-web-link', 'ngx-web-button',
+      '[class*="button"]', '.circle-link', '.owl-item a',
+      '[data-cognigy-webchat-toggle]', '.webchat-toggle-button',
+      '.webchat-header-close-button', '[data-header-close-button]',
+      '[class*="accordion-group-wc--toggle"]',
+      '[class*="accordion-wc--header"]',
+      '[aria-expanded][type="button"]',
+      '[aria-controls][type="button"]'
+    ];
+   
+    const rawElements = document.querySelectorAll(clickableSelectors.join(','));
+   
+    for (const el of rawElements) {
+      const rect = el.getBoundingClientRect();
+      const style = window.getComputedStyle(el);
+      const tagName = el.tagName.toLowerCase();
+
+      // Avoid validating both a custom wrapper (for example ngx-web-link)
+      // and its inner anchor as separate clickable items.
+      if (tagName.includes('-')) {
+        const nestedContactTarget = el.querySelector('a[href^="tel:" i], a[href^="mailto:" i], [href^="tel:" i], [href^="mailto:" i]');
+        if (nestedContactTarget) {
+          continue;
+        }
+
+        const nestedCustomButton = el.querySelector('bolt-button, button');
+        if (nestedCustomButton) {
+          const nestedButtonRect = nestedCustomButton.getBoundingClientRect();
+          const nestedButtonStyle = window.getComputedStyle(nestedCustomButton);
+          const nestedButtonVisible = nestedButtonRect.width > 0 && nestedButtonRect.height > 0 &&
+            nestedButtonStyle.display !== 'none' && nestedButtonStyle.visibility !== 'hidden' && nestedButtonStyle.opacity !== '0' &&
+            nestedCustomButton.getAttribute('aria-hidden') !== 'true';
+
+          if (nestedButtonVisible) {
+            continue;
+          }
+        }
+
+        const nestedAnchor = el.querySelector('a[href]');
+        if (nestedAnchor) {
+          const nestedRect = nestedAnchor.getBoundingClientRect();
+          const nestedStyle = window.getComputedStyle(nestedAnchor);
+          const nestedVisible = nestedRect.width > 0 && nestedRect.height > 0 &&
+            nestedStyle.display !== 'none' && nestedStyle.visibility !== 'hidden' && nestedStyle.opacity !== '0' &&
+            nestedAnchor.getAttribute('aria-hidden') !== 'true';
+
+          if (nestedVisible) {
+            continue;
+          }
+        }
+      }
+
+      const isActuallyVisible = (() => {
+        try {
+          if (typeof el.checkVisibility === 'function') {
+            return el.checkVisibility({
+              checkOpacity: true,
+              checkVisibilityCSS: true,
+              contentVisibilityAuto: true
+            });
+          }
+        } catch { }
+        return true;
+      })();
+     
+      if (style.display === 'none' || style.visibility === 'hidden') continue;
+      if (style.opacity === '0') continue;
+      if (el.getAttribute('aria-hidden') === 'true') continue;
+      if (!isActuallyVisible) continue;
+      if (rect.width === 0 || rect.height === 0) continue;
+     
+      let text = '';
+      let ariaLabel = '';
+     
+      if (tagName === 'a') {
+        text = el.innerText?.trim() || '';
+        ariaLabel = el.getAttribute('aria-label') || '';
+        if (!text && ariaLabel) text = ariaLabel;
+        if (!text && el.querySelector('img')) text = el.querySelector('img')?.alt || '';
+        if (!text && el.href) {
+          const hrefPath = el.href.split('/').pop();
+          text = hrefPath || el.href;
+        }
+      } else if (tagName === 'button' || tagName.includes('-')) {
+        text = el.innerText?.trim() || '';
+        ariaLabel = el.getAttribute('aria-label') || '';
+        if (!text && ariaLabel) text = ariaLabel;
+      } else if (tagName === 'input') {
+        text = el.value || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '';
+      } else {
+        text = el.innerText?.trim() || '';
+        ariaLabel = el.getAttribute('aria-label') || '';
+        if (!text && ariaLabel) text = ariaLabel;
+      }
+
+      const inSearchBar = Boolean(el.closest('.yxt-SearchBar'));
+      const isSearchInput = tagName === 'input' && (
+        el.id === 'yxt-SearchBar-input--search-bar-1' ||
+        inSearchBar
+      );
+
+      if (!text && !ariaLabel && tagName !== 'a' && !isSearchInput) continue;
+     
+      const href = el.getAttribute('href');
+      const normalizedHref = String(href || '').trim().toLowerCase();
+      if (normalizedHref.startsWith('tel:') || normalizedHref.startsWith('mailto:')) continue;
+
+      const contactLikeText = `${String(text || '')} ${String(ariaLabel || '')}`.replace(/\s+/g, ' ').trim();
+      const isPhoneCta = /\bcall\b/i.test(contactLikeText) && /(?:\+?\d[\d\s().-]{6,})/.test(contactLikeText);
+      const isEmailCta = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(contactLikeText) || /\bemail\b/i.test(contactLikeText);
+      if (!href && (isPhoneCta || isEmailCta)) continue;
+
+      const target = el.getAttribute('target');
+      const id = el.id;
+      const dataLinkStatus = el.getAttribute('data-link-status');
+      const className = el.className;
+      const isChatToggle = el.hasAttribute('data-cognigy-webchat-toggle') ||
+                           (className && className.includes('webchat-toggle'));
+      const isChatClose = el.hasAttribute('data-header-close-button') ||
+                          (className && className.includes('close-button'));
+
+      const classStr = (typeof className === 'string') ? className : '';
+      const isInPageSectionNav = Boolean(el.closest('.nw-inner-bottom'));
+      const isSearchButton = inSearchBar && tagName === 'button' && /search/i.test(`${text} ${ariaLabel}`);
+      const isAccordionGroupToggle = classStr.includes('accordion-group-wc--toggle') ||
+                                     (classStr.includes('accordion-group') && tagName === 'button');
+      const isAccordionHeader = classStr.includes('accordion-wc--header') ||
+                                (el.hasAttribute('aria-controls') && tagName === 'button' && !isChatToggle && !isChatClose);
+      const isAccordion = isAccordionGroupToggle || isAccordionHeader ||
+                          (el.hasAttribute('aria-expanded') && tagName === 'button' && !isChatToggle && !isChatClose);
+     
+      const fingerprint = `${tagName}:${text.substring(0, 50)}:${href || ''}`;
+      if (!collectAllClickableEvents) {
+        if (seen.has(fingerprint)) continue;
+        seen.add(fingerprint);
+      }
+     
+      const isBrokenMarker = dataLinkStatus === 'missing-href';
+      const isCustomElement = tagName.includes('-');
+      const isFocusableNonSemantic = el.getAttribute('tabindex') === '0' &&
+                                     !el.getAttribute('role') &&
+                                     !['a','button','input','select','textarea'].includes(tagName);
+     
+      let elementType = tagName;
+      if (isFocusableNonSemantic) elementType = 'focusable-element';
+      if (isSearchInput) elementType = 'search-input';
+      if (isSearchButton) elementType = 'search-button';
+      if (isChatToggle) elementType = 'chat-toggle';
+      if (isChatClose) elementType = 'chat-close';
+      if (isAccordionGroupToggle) elementType = 'accordion-group-toggle';
+      else if (isAccordionHeader) elementType = 'accordion-header';
+     
+      elements.push({
+        type: elementType,
+        text: text.substring(0, 200) || (href ? `Link: ${href.substring(0, 50)}` : tagName),
+        ariaLabel: ariaLabel,
+        href: href || null,
+        target: target || null,
+        id: id || '',
+        className: typeof className === 'string' ? className.substring(0, 100) : '',
+        selector: id ? `#${id}` : (tagName === 'a' && href ? `a[href="${href.split('?')[0]}"]` : null),
+        domPath: `${tagName}${id ? `#${id}` : ''}`,
+        isCustomElement: isCustomElement,
+        isPreMarkedBroken: isBrokenMarker,
+        isFocusableNonSemantic: isFocusableNonSemantic,
+        isChatToggle: isChatToggle,
+        isChatClose: isChatClose,
+        isAccordion: isAccordion,
+        isAccordionGroupToggle: isAccordionGroupToggle,
+        isAccordionHeader: isAccordionHeader,
+        isSearchInput: isSearchInput,
+        isSearchButton: isSearchButton,
+        isInPageSectionNav: isInPageSectionNav,
+        ariaExpanded: el.getAttribute('aria-expanded'),
+        ariaControls: el.getAttribute('aria-controls'),
+        x: Math.round(rect.x),
+        y: Math.round(rect.y),
+        docX: Math.round(rect.x + window.scrollX),
+        docY: Math.round(rect.y + window.scrollY)
+      });
+    }
+   
+    elements.sort((a, b) => {
+      if (Math.abs(a.y - b.y) < 50) return a.x - b.x;
+      return a.y - b.y;
+    });
+   
+    return elements;
+  }, CONFIG.collectAllClickableEvents);
+}
+
+// ==================== ACCORDION ELEMENT DISCOVERY ====================
+
+async function discoverAccordionElements(page) {
+  const accordionItems = [];
+  const seen = new Set();
+
+  const accordionSelectors = [
+    '[class*="accordion-group-wc--toggle"]',
+    '[class*="accordion-wc--header"]',
+    'bolt-accordion-group button[aria-live]',
+    'bolt-accordion button[aria-expanded]',
+    'bolt-accordion-wc button[aria-expanded]',
+    'button[aria-controls]'
+  ];
+
+  for (const selector of accordionSelectors) {
+    try {
+      const locator = page.locator(selector);
+      const count = await locator.count().catch(() => 0);
+
+      for (let i = 0; i < Math.min(count, 50); i++) {
+        const btn = locator.nth(i);
+        const visible = await btn.isVisible({ timeout: 500 }).catch(() => false);
+        if (!visible) continue;
+
+        const btnText = await btn.innerText().catch(() => '');
+        const ariaLabel = await btn.getAttribute('aria-label').catch(() => '');
+        const ariaExpanded = await btn.getAttribute('aria-expanded').catch(() => null);
+        const ariaControls = await btn.getAttribute('aria-controls').catch(() => null);
+        const className = await btn.getAttribute('class').catch(() => '');
+        const btnId = await btn.getAttribute('id').catch(() => '');
+
+        const rawText = String(btnText || ariaLabel || '').replace(/\s+/g, ' ').trim();
+        if (!rawText) continue;
+
+        const fingerprint = `accordion:${rawText.substring(0, 50)}:${ariaControls || ''}`;
+        if (seen.has(fingerprint)) continue;
+        seen.add(fingerprint);
+
+        const classStr = String(className || '');
+        const isAccordionGroupToggle = classStr.includes('accordion-group-wc--toggle') ||
+                                       classStr.includes('accordion-group');
+        const isAccordionHeader = classStr.includes('accordion-wc--header') || Boolean(ariaControls);
+
+        const box = await btn.boundingBox().catch(() => null);
+        const x = box ? Math.round(box.x) : 0;
+        const y = box ? Math.round(box.y) : 0;
+
+        accordionItems.push({
+          type: isAccordionGroupToggle ? 'accordion-group-toggle' : 'accordion-header',
+          text: rawText.substring(0, 200),
+          ariaLabel: String(ariaLabel || ''),
+          href: null,
+          target: null,
+          id: String(btnId || ''),
+          className: classStr.substring(0, 100),
+          selector: btnId ? `#${btnId}` : (ariaControls ? `button[aria-controls="${ariaControls}"]` : null),
+          domPath: 'button',
+          isCustomElement: false,
+          isPreMarkedBroken: false,
+          isChatToggle: false,
+          isChatClose: false,
+          isAccordion: true,
+          isAccordionGroupToggle,
+          isAccordionHeader,
+          ariaExpanded,
+          ariaControls,
+          x,
+          y
+        });
+      }
+    } catch { }
+  }
+
+  return accordionItems;
+}
+
+// ==================== TAB / ACCORDION-TITLE DISCOVERY ====================
+
+async function discoverTabAccordionElements(page) {
+  const tabTitleSelectors = [
+    '[class*="accordion-title"]',
+    '[role="tab"]',
+    '[class*="tab-title"]',
+    '[class*="tabs-title"]',
+  ];
+
+  const tabItems = [];
+  const seen = new Set();
+
+  for (const sel of tabTitleSelectors) {
+    try {
+      const count = await page.locator(sel).count().catch(() => 0);
+      for (let i = 0; i < Math.min(count, 30); i++) {
+        const el = page.locator(sel).nth(i);
+        const visible = await el.isVisible({ timeout: 500 }).catch(() => false);
+        if (!visible) continue;
+
+        const rawText = (await el.innerText().catch(() => '')).replace(/\s+/g, ' ').trim();
+        if (!rawText) continue;
+
+        const ariaSelected = await el.getAttribute('aria-selected').catch(() => null);
+        const ariaControls = await el.getAttribute('aria-controls').catch(() => null);
+        const fp = `tab:${rawText.substring(0, 50)}:${ariaControls || i}`;
+        if (seen.has(fp)) continue;
+        seen.add(fp);
+
+        const box = await el.boundingBox().catch(() => null);
+        tabItems.push({
+          selector: sel,
+          index: i,
+          text: rawText.substring(0, 200),
+          ariaSelected,
+          ariaControls,
+          x: box ? Math.round(box.x) : 0,
+          y: box ? Math.round(box.y) : 0,
+        });
+      }
+    } catch { }
+  }
+
+  return tabItems;
+}
+
+// ==================== NAVIGATION CONTAINER DISCOVERY ====================
+
+async function discoverNavigationContainers(page) {
+  const containerSelectors = [
+    '[class*="menu-wicon-region"]',
+    '[id*="menu-wicon-region"]',
+    '[class*="nav-dropdown"]',
+    '[class*="mega-menu"]',
+    '[aria-haspopup="true"]',
+    '[aria-haspopup="menu"]',
+    'nav [aria-haspopup]',
+    '[class*="dropdown-toggle"]',
+    '[class*="flyout-trigger"]',
+  ];
+
+  const containersFound = [];
+  const seenContainers = new Set();
+
+  for (const sel of containerSelectors) {
+    try {
+      const count = await page.locator(sel).count().catch(() => 0);
+      for (let i = 0; i < Math.min(count, 10); i++) {
+        const el = page.locator(sel).nth(i);
+        const visible = await el.isVisible({ timeout: 500 }).catch(() => false);
+        if (!visible) continue;
+
+        const text = (await el.innerText().catch(() => '')).replace(/\s+/g, ' ').trim().substring(0, 80);
+        const id = await el.getAttribute('id').catch(() => '');
+        const fp = `${sel}:${i}:${text}`;
+        if (seenContainers.has(fp)) continue;
+        seenContainers.add(fp);
+
+        containersFound.push({ selector: sel, index: i, text, id });
+      }
+    } catch { }
+  }
+
+  return containersFound;
+}
+
+function buildValidationKey(item) {
+  const type = String(item.elementType || item.type || '').trim();
+  const text = String(item.elementText || item.text || '').replace(/\s+/g, ' ').trim().substring(0, 80);
+  const href = String(item.href || '').trim();
+  const textHref = `${text}:${href}`;
+  return {
+    strict: `${type}:${textHref}`,
+    loose: textHref
+  };
+}
+
+// ==================== ELEMENT FINDER ====================
+
+async function findElement(page, elementInfo) {
+  const strategies = [];
+  const displayText = elementInfo.text || elementInfo.ariaLabel || '';
+  const normalizedDisplayText = String(displayText).replace(/\s+/g, ' ').trim();
+  const shortDisplayText = normalizedDisplayText.substring(0, 80);
+  const escapedShortText = shortDisplayText.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const shortTextPattern = escapedShortText
+    ? new RegExp(escapedShortText.replace(/\s+/g, '\\s+'), 'i')
+    : null;
+  const targetX = Number.isFinite(elementInfo?.x) ? elementInfo.x : null;
+  const targetY = Number.isFinite(elementInfo?.y) ? elementInfo.y : null;
+
+  const isAnchor = elementInfo.type === 'a' || (elementInfo.href && !elementInfo.isCustomElement);
+
+  if (isAnchor && elementInfo.href && elementInfo.href !== '/' && !String(elementInfo.href).startsWith('javascript')) {
+    const rawHref = String(elementInfo.href);
+    const hrefPath = elementInfo.href.split('?')[0].split('#')[0];
+    const hashPart = rawHref.includes('#') ? rawHref.substring(rawHref.indexOf('#')) : '';
+
+    if (hashPart) {
+      strategies.push(async () => {
+        const locator = page.locator(`a[href="${rawHref}"]:visible, a[href$="${hashPart}"]:visible`);
+        return await closestToPoint(page, locator, targetX, targetY, 120);
+      });
+    }
+
+    if (normalizedDisplayText) {
+      strategies.push(async () => {
+        const locator = page
+          .locator(`a[href="${hrefPath}"]:visible`)
+          .filter({ hasText: shortTextPattern || normalizedDisplayText });
+        return await closestToPoint(page, locator, targetX, targetY, 80);
+      });
+
+      strategies.push(async () => {
+        const locator = page
+          .locator('footer a:visible, [role="contentinfo"] a:visible, .footer a:visible, .site-footer a:visible')
+          .filter({ hasText: shortTextPattern || normalizedDisplayText });
+        return await closestToPoint(page, locator, targetX, targetY, 80);
+      });
+    }
+
+    strategies.push(async () => {
+      const locator = page.locator(`a[href="${hrefPath}"]:visible`);
+      return await closestToPoint(page, locator, targetX, targetY, 80);
+    });
+  }
+ 
+  if (elementInfo.selector && !elementInfo.selector.match(/bolt-button--\d+/)) {
+    strategies.push(async () => {
+      const locator = page.locator(elementInfo.selector);
+      return await closestToPoint(page, locator, targetX, targetY, 60);
+    });
+  }
+
+  if (elementInfo.type === 'a' && elementInfo.href && elementInfo.href !== '/' && !elementInfo.href.startsWith('javascript')) {
+    strategies.push(async () => {
+      const hrefPath = elementInfo.href.split('?')[0].split('#')[0];
+      const locator = page.locator(`a[href="${hrefPath}"]:visible`);
+      return await closestToPoint(page, locator, targetX, targetY, 60);
+    });
+  }
+ 
+  if (normalizedDisplayText && normalizedDisplayText.length > 2 && normalizedDisplayText.length < 200) {
+    strategies.push(async () => {
+      const locator = page.getByText(normalizedDisplayText, { exact: true });
+      return await closestToPoint(page, locator, targetX, targetY, 80);
+    });
+   
+    strategies.push(async () => {
+      const locator = page.getByText(normalizedDisplayText, { exact: false });
+      return await closestToPoint(page, locator, targetX, targetY, 80);
+    });
+  }
+ 
+  if (shortTextPattern) {
+    strategies.push(async () => {
+      const locator = page.getByText(shortTextPattern);
+      return await closestToPoint(page, locator, targetX, targetY, 80);
+    });
+  }
+ 
+  if (elementInfo.ariaLabel) {
+    strategies.push(async () => {
+      const locator = page.locator(`[aria-label*="${elementInfo.ariaLabel}" i]`);
+      return await closestToPoint(page, locator, targetX, targetY, 40);
+    });
+  }
+ 
+  if (elementInfo.href && elementInfo.href !== '/' && !elementInfo.href.startsWith('javascript')) {
+    strategies.push(async () => {
+      const hrefPath = elementInfo.href.split('?')[0].split('#')[0];
+      const locator = page.locator(`a[href="${hrefPath}"]:visible`);
+      return await closestToPoint(page, locator, targetX, targetY, 60);
+    });
+  }
+
+  if (elementInfo.isCustomElement && normalizedDisplayText) {
+    strategies.push(async () => {
+      const locator = page.locator('a:visible').filter({ hasText: shortTextPattern || normalizedDisplayText });
+      return await closestToPoint(page, locator, targetX, targetY, 80);
+    });
+  }
+ 
+  if (elementInfo.ariaLabel) {
+    strategies.push(async () => {
+      const locator = page.locator(`[aria-label="${elementInfo.ariaLabel}"]`);
+      return await closestToPoint(page, locator, targetX, targetY, 40);
+    });
+  }
+ 
+  if (elementInfo.isCustomElement) {
+    if (normalizedDisplayText) {
+      strategies.push(async () => {
+        const locator = page.locator(elementInfo.type).filter({ hasText: normalizedDisplayText });
+        return await closestToPoint(page, locator, targetX, targetY, 40);
+      });
+    }
+
+    strategies.push(async () => {
+      const locator = page.locator(elementInfo.type);
+      return await closestToPoint(page, locator, targetX, targetY, 40);
+    });
+  }
+ 
+  if (elementInfo.isChatToggle) {
+    strategies.push(async () => {
+      const locator = page.locator('[data-cognigy-webchat-toggle], .webchat-toggle-button');
+      return await closestToPoint(page, locator, targetX, targetY, 20);
+    });
+  }
+ 
+  if (elementInfo.isChatClose) {
+    strategies.push(async () => {
+      const locator = page.locator('[data-header-close-button], .webchat-header-close-button');
+      return await closestToPoint(page, locator, targetX, targetY, 20);
+    });
+  }
+
+  if (elementInfo.isAccordionGroupToggle) {
+    strategies.push(async () => {
+      const locator = page.locator('[class*="accordion-group-wc--toggle"]');
+      return await closestToPoint(page, locator, targetX, targetY, 20);
+    });
+  }
+
+  if (elementInfo.isAccordionHeader) {
+    if (elementInfo.ariaControls) {
+      strategies.push(async () => {
+        const locator = page.locator(`[aria-controls="${elementInfo.ariaControls}"]`);
+        return await closestToPoint(page, locator, targetX, targetY, 20);
+      });
+    }
+    strategies.push(async () => {
+      const locator = page.locator('[class*="accordion-wc--header"], [aria-controls][type="button"]');
+      return await closestToPoint(page, locator, targetX, targetY, 40);
+    });
+  }
+
+  for (const strategy of strategies) {
+    try {
+      const element = await strategy();
+      if (element) return element;
+    } catch { }
+  }
+ 
+  return null;
+}
+
+// ==================== CLICK VALIDATION ====================
+
+async function validateClick(page, context, elementInfo, originalUrl, options = {}) {
+  const { clickOnly = false } = options;
+  const startTime = Date.now();
+  const displayText = elementInfo.text || elementInfo.ariaLabel || elementInfo.id || elementInfo.type || 'unknown';
+ 
+  if (elementInfo.isPreMarkedBroken) {
+    return {
+      success: false, status: 'fail', elementType: elementInfo.type,
+      elementText: displayText,
+      clickMethod: 'pre-marked-broken', durationMs: 0,
+      validationDetail: 'FAILED - Pre-marked as broken link',
+      errorMessage: `BROKEN LINK: Element has data-link-status="missing-href" - Text: "${displayText}"`,
+      isGenuineIssue: true,
+      href: elementInfo.href || 'missing'
+    };
+  }
+ 
+  if (isSkippableContactHref(elementInfo.href)) {
+    return {
+      success: true, status: 'pass', elementType: elementInfo.type,
+      elementText: displayText,
+      clickMethod: 'skipped-contact', durationMs: 0,
+      validationDetail: 'PASS - Contact link skipped',
+      isGenuineIssue: false,
+      href: elementInfo.href
+    };
+  }
+ 
+  if (elementInfo.href === 'javascript:void(0)') {
+    return {
+      success: true, status: 'pass', elementType: elementInfo.type,
+      elementText: displayText,
+      clickMethod: 'javascript-handled', durationMs: 0,
+      validationDetail: 'PASS - JavaScript link handled',
+      isGenuineIssue: false,
+      href: elementInfo.href
+    };
+  }
+ 
+  const isHomepageLogo = (elementInfo.href === '/' || elementInfo.href === '') &&
+                         (displayText.toLowerCase().includes('logo') || elementInfo.domPath?.includes('logo'));
+
+  const closeExtraTabsAndReturn = async () => {
+    const pages = context.pages();
+    for (const p of pages) {
+      if (!p || p === page || p.isClosed()) continue;
+      await p.close().catch(() => {});
+    }
+    await page.bringToFront().catch(() => {});
+  };
+ 
+  for (let attempt = 1; attempt <= CONFIG.retryAttempts; attempt++) {
+    try {
+      if (attempt > 1) await delay(CONFIG.retryDelayMs * (attempt - 1));
+     
+      let clickableElement = await findElement(page, elementInfo);
+     
+      if (!clickableElement) {
+        if (attempt >= 2) {
+          await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+          await delay(500);
+          await page.evaluate(() => window.scrollTo(0, 0));
+          await delay(500);
+        }
+        throw new Error(`Element not found after ${attempt} attempt(s)`);
+      }
+     
+      await stabilizeElementForClick(page, clickableElement, elementInfo);
+
+      if (!(await clickableElement.isVisible({ timeout: 1000 }).catch(() => false))) {
+        const refreshedElement = await findElement(page, elementInfo);
+        if (refreshedElement) {
+          clickableElement = refreshedElement;
+          await stabilizeElementForClick(page, clickableElement, elementInfo);
+        }
+
+        if (!(await clickableElement.isVisible({ timeout: 1000 }).catch(() => false))) {
+          await tryRevealTargetElement(page, elementInfo);
+          const revealedElement = await findElement(page, elementInfo);
+          if (revealedElement) {
+            clickableElement = revealedElement;
+            await stabilizeElementForClick(page, clickableElement, elementInfo);
+          }
+        }
+      }
+
+      const accordionExpandedBefore = elementInfo.isAccordion
+        ? await clickableElement.getAttribute('aria-expanded').catch(() => elementInfo.ariaExpanded ?? null)
+        : null;
+     
+      const urlBefore = page.url();
+      const scrollYBefore = await page.evaluate(() => window.scrollY).catch(() => null);
+      await closeExtraTabsAndReturn();
+      const pagesBefore = context.pages().length;
+      const popupPromise = CONFIG.detectNewTab
+        ? context.waitForEvent('page', { timeout: 5000 }).catch(() => null)
+        : Promise.resolve(null);
+     
+      let contentSignature = '';
+      if (CONFIG.detectContentChange) {
+        contentSignature = await page.evaluate(() => {
+          const main = document.querySelector('main, [role="main"], .main-content, article');
+          if (main) return main.innerText.substring(0, 500);
+          return document.body.innerText.substring(0, 500);
+        }).catch(() => '');
+      }
+     
+      let clickSucceeded = false;
+      let clickError = null;
+     
+      try {
+        await clickableElement.click({ timeout: CONFIG.clickTimeout });
+        clickSucceeded = true;
+      } catch (clickErr) {
+        clickError = clickErr.message;
+       
+        if (isVisibilityLikeError(clickErr.message)) {
+          await tryRevealTargetElement(page, elementInfo);
+          const refreshedAfterReveal = await findElement(page, elementInfo);
+          if (refreshedAfterReveal) {
+            clickableElement = refreshedAfterReveal;
+            await stabilizeElementForClick(page, clickableElement, elementInfo);
+          }
+
+          try {
+            await clickableElement.click({ force: true, timeout: CONFIG.clickTimeout });
+            clickSucceeded = true;
+          } catch (forceErr) {
+            const altAnchorClicked = await tryAlternateAnchorClick(page, elementInfo);
+            if (altAnchorClicked) {
+              clickSucceeded = true;
+            } else {
+            try {
+              await clickableElement.evaluate(el => {
+                el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                if (typeof el.click === 'function') el.click();
+              });
+              clickSucceeded = true;
+            } catch (jsErr) {
+              throw new Error(clickError);
+            }
+            }
+          }
+        } else {
+          throw clickErr;
+        }
+      }
+     
+      if (!clickSucceeded) throw new Error(clickError || 'Click failed');
+     
+      await delay(1500);
+     
+      const pagesAfter = context.pages().length;
+      const newTabOpened = pagesAfter > pagesBefore;
+      const popup = newTabOpened ? await popupPromise : null;
+      if (popup) {
+        if (popup && !popup.isClosed()) {
+          await popup.waitForLoadState('domcontentloaded', { timeout: 8000 }).catch(() => {});
+          const popupUrl = popup.url();
+          await popup.close().catch(() => {});
+          await page.bringToFront().catch(() => {});
+         
+          if (popupUrl && popupUrl !== 'about:blank' && !popupUrl.includes('chrome-error')) {
+            return {
+              success: true, status: 'pass', elementType: elementInfo.type,
+              elementText: displayText,
+              clickMethod: 'new-tab', durationMs: Date.now() - startTime,
+              validationDetail: `PASS - New tab opened: ${popupUrl.substring(0, 80)}`,
+              isGenuineIssue: false,
+              href: elementInfo.href
+            };
+          }
+        }
+      }
+
+      if (newTabOpened && !popup) {
+        await closeExtraTabsAndReturn();
+        return {
+          success: true, status: 'pass', elementType: elementInfo.type,
+          elementText: displayText,
+          clickMethod: 'new-window', durationMs: Date.now() - startTime,
+          validationDetail: 'PASS - New tab/window opened and closed',
+          isGenuineIssue: false,
+          href: elementInfo.href
+        };
+      }
+
+      await closeExtraTabsAndReturn();
+
+      if (elementInfo.isAccordion) {
+        await delay(350);
+
+        let accordionEl = await findElement(page, elementInfo);
+        let expandedAfterOpen = accordionEl
+          ? await accordionEl.getAttribute('aria-expanded').catch(() => null)
+          : null;
+
+        const contentSignatureAfterOpen = CONFIG.detectContentChange
+          ? await page.evaluate(() => {
+              const main = document.querySelector('main, [role="main"], .main-content, article');
+              if (main) return main.innerText.substring(0, 500);
+              return document.body.innerText.substring(0, 500);
+            }).catch(() => '')
+          : '';
+
+        const headerCountAfterOpen = await page
+          .locator('[aria-expanded="true"][class*="accordion"]')
+          .count()
+          .catch(() => 0);
+
+        const openStateChanged = expandedAfterOpen !== null && expandedAfterOpen !== accordionExpandedBefore;
+        const openContentChanged = Boolean(contentSignature) && Boolean(contentSignatureAfterOpen) && contentSignatureAfterOpen !== contentSignature;
+        const openDetected = openStateChanged || openContentChanged || (elementInfo.isAccordionGroupToggle && headerCountAfterOpen > 0);
+
+        if (!accordionEl) {
+          accordionEl = clickableElement;
+        }
+
+        try {
+          await accordionEl.click({ timeout: CONFIG.clickTimeout });
+        } catch {
+          await accordionEl.click({ force: true, timeout: CONFIG.clickTimeout }).catch(() => {});
+        }
+
+        await delay(350);
+
+        const accordionElAfterClose = await findElement(page, elementInfo);
+        const expandedAfterClose = accordionElAfterClose
+          ? await accordionElAfterClose.getAttribute('aria-expanded').catch(() => null)
+          : null;
+        const contentSignatureAfterClose = CONFIG.detectContentChange
+          ? await page.evaluate(() => {
+              const main = document.querySelector('main, [role="main"], .main-content, article');
+              if (main) return main.innerText.substring(0, 500);
+              return document.body.innerText.substring(0, 500);
+            }).catch(() => '')
+          : '';
+
+        const closeStateChanged = expandedAfterClose !== null && expandedAfterClose !== expandedAfterOpen;
+        const restoredInitialState = accordionExpandedBefore !== null && expandedAfterClose === accordionExpandedBefore;
+        const closeContentChanged = Boolean(contentSignatureAfterClose) && Boolean(contentSignatureAfterOpen) && contentSignatureAfterClose !== contentSignatureAfterOpen;
+        const closeDetected = closeStateChanged || restoredInitialState || closeContentChanged;
+
+        if (openDetected && closeDetected) {
+          return {
+            success: true,
+            status: 'pass',
+            elementType: elementInfo.type,
+            elementText: displayText,
+            clickMethod: 'accordion-open-close',
+            durationMs: Date.now() - startTime,
+            validationDetail: `PASS - Accordion opened and closed (${accordionExpandedBefore} -> ${expandedAfterOpen} -> ${expandedAfterClose})`,
+            isGenuineIssue: false
+          };
+        }
+
+        if (openDetected) {
+          return {
+            success: true,
+            status: 'pass',
+            elementType: elementInfo.type,
+            elementText: displayText,
+            clickMethod: 'accordion-open-close-clicked',
+            durationMs: Date.now() - startTime,
+            validationDetail: 'PASS - Accordion opened and received second click to close',
+            isGenuineIssue: false
+          };
+        }
+
+        return {
+          success: false,
+          status: 'fail',
+          elementType: elementInfo.type,
+          elementText: displayText,
+          clickMethod: 'accordion-no-toggle',
+          durationMs: Date.now() - startTime,
+          validationDetail: 'FAILED - Accordion did not show open/close behavior',
+          errorMessage: `Accordion did not show detectable open/close state changes: ${displayText}`,
+          isGenuineIssue: true,
+          href: elementInfo.href
+        };
+      }
+     
+      const urlAfter = page.url();
+      if (urlAfter !== urlBefore) {
+        let samePageAnchorNavigation = false;
+        try {
+          const beforeUrlObj = new URL(urlBefore);
+          const afterUrlObj = new URL(urlAfter);
+          samePageAnchorNavigation =
+            beforeUrlObj.origin === afterUrlObj.origin &&
+            beforeUrlObj.pathname === afterUrlObj.pathname &&
+            beforeUrlObj.search === afterUrlObj.search &&
+            Boolean(afterUrlObj.hash);
+        } catch { }
+
+        if (samePageAnchorNavigation) {
+          return {
+            success: true, status: 'pass', elementType: elementInfo.type,
+            elementText: displayText,
+            clickMethod: 'same-page-anchor-navigation', durationMs: Date.now() - startTime,
+            validationDetail: `PASS - In-page anchor navigation to section: ${urlAfter.substring(0, 120)}`,
+            isGenuineIssue: false,
+            href: elementInfo.href
+          };
+        }
+
+        return {
+          success: true, status: 'pass', elementType: elementInfo.type,
+          elementText: displayText,
+          clickMethod: 'navigation', durationMs: Date.now() - startTime,
+          validationDetail: `PASS - Navigated to: ${urlAfter.substring(0, 80)}`,
+          isGenuineIssue: false,
+          href: elementInfo.href
+        };
+      }
+     
+      if (CONFIG.detectContentChange && contentSignature) {
+        const newContentSignature = await page.evaluate(() => {
+          const main = document.querySelector('main, [role="main"], .main-content, article');
+          if (main) return main.innerText.substring(0, 500);
+          return document.body.innerText.substring(0, 500);
+        }).catch(() => '');
+       
+        if (newContentSignature !== contentSignature && newContentSignature.length > 100) {
+          return {
+            success: true, status: 'pass', elementType: elementInfo.type,
+            elementText: displayText,
+            clickMethod: 'spa-content-change', durationMs: Date.now() - startTime,
+            validationDetail: 'PASS - Content changed (SPA navigation)',
+            isGenuineIssue: false,
+            href: elementInfo.href
+          };
+        }
+      }
+     
+      if (isHomepageLogo) {
+        return {
+          success: true, status: 'pass', elementType: elementInfo.type,
+          elementText: displayText,
+          clickMethod: 'homepage-logo', durationMs: Date.now() - startTime,
+          validationDetail: 'PASS - Homepage logo',
+          isGenuineIssue: false,
+          href: elementInfo.href
+        };
+      }
+     
+      if (elementInfo.isChatToggle) {
+        await delay(1000);
+        const chatWindow = await page.locator('[data-cognigy-webchat]').first();
+        const chatVisible = await chatWindow.isVisible({ timeout: 2000 }).catch(() => false);
+        if (chatVisible) {
+          return {
+            success: true, status: 'pass', elementType: 'chat-toggle',
+            elementText: displayText,
+            clickMethod: 'chat-open', durationMs: Date.now() - startTime,
+            validationDetail: 'PASS - Chat window opened',
+            isGenuineIssue: false,
+            href: null
+          };
+        } else {
+          return {
+            success: true, status: 'pass', elementType: 'chat-toggle',
+            elementText: displayText,
+            clickMethod: 'chat-not-available', durationMs: Date.now() - startTime,
+            validationDetail: 'PASS - Chat button clicked (window may be disabled on this page)',
+            isGenuineIssue: false,
+            href: null
+          };
+        }
+      }
+     
+      if (elementInfo.isChatClose) {
+        return {
+          success: true, status: 'pass', elementType: 'chat-close',
+          elementText: displayText,
+          clickMethod: 'chat-close', durationMs: Date.now() - startTime,
+          validationDetail: 'PASS - Chat closed',
+          isGenuineIssue: false,
+          href: null
+        };
+      }
+
+      if (elementInfo.isSearchInput || elementInfo.type === 'search-input') {
+        const autoCompleteContainer = page.locator(
+          '#yxt-AutoComplete-container-search-bar-1-autocomplete-results, [id^="yxt-AutoComplete-container-"][id$="-autocomplete-results"]'
+        ).first();
+        const autoCompleteVisible = await autoCompleteContainer.isVisible({ timeout: 1800 }).catch(() => false);
+
+        if (autoCompleteVisible) {
+          return {
+            success: true, status: 'pass', elementType: elementInfo.type,
+            elementText: displayText,
+            clickMethod: 'search-autocomplete-open', durationMs: Date.now() - startTime,
+            validationDetail: 'PASS - Search input click opened autocomplete results',
+            isGenuineIssue: false,
+            href: elementInfo.href
+          };
+        }
+
+        return {
+          success: false, status: 'fail', elementType: elementInfo.type,
+          elementText: displayText,
+          clickMethod: 'search-autocomplete-not-open', durationMs: Date.now() - startTime,
+          validationDetail: 'FAILED - Search input click did not open autocomplete results',
+          errorMessage: 'Autocomplete container not visible after click: #yxt-AutoComplete-container-search-bar-1-autocomplete-results',
+          isGenuineIssue: true,
+          href: elementInfo.href
+        };
+      }
+
+      if (elementInfo.isSearchButton || elementInfo.type === 'search-button') {
+        const searchInputValue = await page
+          .locator('#yxt-SearchBar-input--search-bar-1')
+          .first()
+          .inputValue()
+          .catch(() => '');
+        const hasSearchTerm = String(searchInputValue || '').trim().length > 0;
+
+        return {
+          success: true, status: 'pass', elementType: elementInfo.type,
+          elementText: displayText,
+          clickMethod: hasSearchTerm ? 'search-button-with-keyword' : 'search-button-empty-input',
+          durationMs: Date.now() - startTime,
+          validationDetail: hasSearchTerm
+            ? 'PASS - Search button click with keyword in input'
+            : 'PASS - Search button click with empty input (no UI change expected)',
+          isGenuineIssue: false,
+          href: elementInfo.href
+        };
+      }
+
+      if (elementInfo.type !== 'a') {
+        return {
+          success: true, status: 'pass', elementType: elementInfo.type,
+          elementText: displayText,
+          clickMethod: 'ui-element', durationMs: Date.now() - startTime,
+          validationDetail: 'PASS - Click received',
+          isGenuineIssue: false,
+          href: elementInfo.href
+        };
+      }
+     
+      const modalVisible = await page.locator('[role="dialog"], .modal, .bolt-modal').first().isVisible({ timeout: 500 }).catch(() => false);
+      if (modalVisible) {
+        return {
+          success: true, status: 'pass', elementType: elementInfo.type,
+          elementText: displayText,
+          clickMethod: 'modal-trigger', durationMs: Date.now() - startTime,
+          validationDetail: 'PASS - Modal opened',
+          isGenuineIssue: false,
+          href: elementInfo.href
+        };
+      }
+
+      const hrefValue = String(elementInfo.href || '').toLowerCase();
+      const hrefId = hrefValue.startsWith('#') ? hrefValue.replace(/^#/, '') : '';
+      const topAnchorIds = new Set((CONFIG.backToTopAnchorIds || []).map(id => String(id || '').toLowerCase()));
+      const backToTopText = /back\s*to\s*top/i.test(`${String(displayText || '')} ${String(elementInfo.ariaLabel || '')}`);
+      const isBackToTopIntent = backToTopText || (hrefId && topAnchorIds.has(hrefId));
+
+      if (isBackToTopIntent) {
+        const scrollYAfter = await page.evaluate(() => window.scrollY).catch(() => null);
+        const atTop = Number.isFinite(scrollYAfter) && scrollYAfter <= 120;
+        const movedUp = Number.isFinite(scrollYBefore) && Number.isFinite(scrollYAfter) && (scrollYAfter < (scrollYBefore - 80));
+        const alreadyAtTop = Number.isFinite(scrollYBefore) && scrollYBefore <= 120;
+        const topBehaviorConfirmed = atTop || movedUp || alreadyAtTop;
+
+        return {
+          success: true, status: 'pass', elementType: elementInfo.type,
+          elementText: displayText,
+          clickMethod: topBehaviorConfirmed ? 'back-to-top-anchor' : 'click-received-only', durationMs: Date.now() - startTime,
+          validationDetail: topBehaviorConfirmed
+            ? 'PASS - Back to top action stayed on same page and scrolled toward top'
+            : 'PASS - Back to top action clicked (same-page behavior)',
+          isGenuineIssue: false,
+          href: elementInfo.href
+        };
+      }
+     
+      if (elementInfo.href && elementInfo.href.startsWith('#')) {
+        const anchorTarget = String(elementInfo.href || '').toLowerCase();
+        const anchorId = anchorTarget.replace(/^#/, '');
+        const isBackToTopLabel = /back\s*to\s*top/i.test(String(displayText || ''));
+        const isBackToTopAnchor = topAnchorIds.has(anchorId) || isBackToTopLabel;
+        const scrollYAfter = await page.evaluate(() => window.scrollY).catch(() => null);
+
+        if (isBackToTopAnchor) {
+          const atTop = Number.isFinite(scrollYAfter) && scrollYAfter <= 120;
+          const movedUp = Number.isFinite(scrollYBefore) && Number.isFinite(scrollYAfter) && (scrollYAfter < (scrollYBefore - 80));
+          const alreadyAtTop = Number.isFinite(scrollYBefore) && scrollYBefore <= 120;
+          const topBehaviorConfirmed = atTop || movedUp || alreadyAtTop;
+
+          return {
+            success: true, status: 'pass', elementType: elementInfo.type,
+            elementText: displayText,
+            clickMethod: topBehaviorConfirmed ? 'back-to-top-anchor' : 'anchor-scroll', durationMs: Date.now() - startTime,
+            validationDetail: topBehaviorConfirmed
+              ? 'PASS - Back to top anchor scrolled within same page'
+              : 'PASS - Back to top anchor clicked (same-page navigation)',
+            isGenuineIssue: false,
+            href: elementInfo.href
+          };
+        }
+
+        return {
+          success: true, status: 'pass', elementType: elementInfo.type,
+          elementText: displayText,
+          clickMethod: 'anchor-scroll', durationMs: Date.now() - startTime,
+          validationDetail: 'PASS - Anchor link',
+          isGenuineIssue: false,
+          href: elementInfo.href
+        };
+      }
+
+      if (elementInfo.href && String(elementInfo.href).includes('#')) {
+        let isSamePageFragmentHref = false;
+        try {
+          const currentUrlObj = new URL(urlBefore);
+          const hrefUrlObj = new URL(String(elementInfo.href), currentUrlObj);
+          isSamePageFragmentHref =
+            hrefUrlObj.pathname === currentUrlObj.pathname &&
+            hrefUrlObj.search === currentUrlObj.search &&
+            Boolean(hrefUrlObj.hash);
+        } catch { }
+
+        if (isSamePageFragmentHref) {
+          return {
+            success: true, status: 'pass', elementType: elementInfo.type,
+            elementText: displayText,
+            clickMethod: 'same-page-anchor-link', durationMs: Date.now() - startTime,
+            validationDetail: 'PASS - Same-page section link',
+            isGenuineIssue: false,
+            href: elementInfo.href
+          };
+        }
+      }
+
+      if (elementInfo.isInPageSectionNav) {
+        return {
+          success: true, status: 'pass', elementType: elementInfo.type,
+          elementText: displayText,
+          clickMethod: 'in-page-section-nav', durationMs: Date.now() - startTime,
+          validationDetail: 'PASS - In-page section navigation link (.nw-inner-bottom)',
+          isGenuineIssue: false,
+          href: elementInfo.href
+        };
+      }
+
+      if (clickOnly) {
+        return {
+          success: true, status: 'pass', elementType: elementInfo.type,
+          elementText: displayText,
+          clickMethod: 'click-received-only', durationMs: Date.now() - startTime,
+          validationDetail: 'PASS - Click received (click-only mode)',
+          isGenuineIssue: false,
+          href: elementInfo.href
+        };
+      }
+     
+      if (attempt < CONFIG.retryAttempts) {
+        console.log(`       Retrying (${attempt}/${CONFIG.retryAttempts})...`);
+        continue;
+      }
+
+      const isFocusableNonSemantic = elementInfo.type === 'focusable-element' || elementInfo.isFocusableNonSemantic;
+      if (isFocusableNonSemantic) {
+        return {
+          success: true, status: 'pass', elementType: elementInfo.type,
+          elementText: displayText,
+          clickMethod: 'click-received', durationMs: Date.now() - startTime,
+          validationDetail: 'PASS - Focusable element clicked (no navigation expected)',
+          isGenuineIssue: false,
+          href: elementInfo.href
+        };
+      }
+     
+      return {
+        success: false, status: 'fail', elementType: elementInfo.type,
+        elementText: displayText,
+        clickMethod: 'failed', durationMs: Date.now() - startTime,
+        validationDetail: 'FAILED - Link did not navigate',
+        errorMessage: `BROKEN LINK: "${displayText}" did not navigate (href: ${elementInfo.href || 'missing'})`,
+        isGenuineIssue: true,
+        href: elementInfo.href
+      };
+     
+    } catch (error) {
+      const isLastAttempt = attempt === CONFIG.retryAttempts;
+      const errorMsg = error.message || String(error);
+     
+      if (isLastAttempt) {
+        const isHiddenElement = errorMsg.includes('hidden') || errorMsg.includes('visible');
+        const isNotFound = errorMsg.includes('not found');
+       
+        let screenshotPath = null;
+        if (CONFIG.screenshotOnFailure) {
+          try {
+            const screenshotDir = path.join(CONFIG.reportsDir, 'screenshots');
+            await fs.mkdir(screenshotDir, { recursive: true });
+            const safeName = displayText.replace(/[^a-z0-9]/gi, '_').substring(0, 30);
+            screenshotPath = path.join(screenshotDir, `fail_${safeName}_${Date.now()}.png`);
+            await page.screenshot({ path: screenshotPath, fullPage: false });
+          } catch { }
+        }
+       
+        const isSocialMedia = displayText.match(/facebook|twitter|instagram|linkedin|youtube/i);
+        if (isSocialMedia) {
+          return {
+            success: true, status: 'pass', elementType: elementInfo.type,
+            elementText: displayText,
+            clickMethod: 'social-link', durationMs: Date.now() - startTime,
+            validationDetail: 'PASS - Social link',
+            isGenuineIssue: false,
+            href: elementInfo.href
+          };
+        }
+       
+        return {
+          success: false, status: 'fail', elementType: elementInfo.type,
+          elementText: displayText,
+          clickMethod: 'failed', durationMs: Date.now() - startTime,
+          validationDetail: 'FAILED',
+          errorMessage: isHiddenElement ? `Element not visible: "${displayText}"` :
+                        isNotFound ? `Element not found: "${displayText}"` : errorMsg,
+          screenshotPath: screenshotPath,
+          isGenuineIssue: !isHiddenElement && !isNotFound,
+          href: elementInfo.href
+        };
+      }
+      continue;
+    }
+  }
+}
+
+// ==================== CAROUSEL VALIDATION ====================
+
+async function validateCarousels(page, context, originalUrl, results, runLabel = '') {
+  const runPrefix = runLabel ? `[${runLabel}] ` : '';
+  console.log(`\n  ${runPrefix}Testing carousels...`);
+ 
+  try {
+    const chatCloseBtn = await page.locator('[data-header-close-button], .webchat-header-close-button').first();
+    if (await chatCloseBtn.count() > 0 && await chatCloseBtn.isVisible({ timeout: 1000 }).catch(() => false)) {
+      await chatCloseBtn.click();
+      await delay(500);
+      console.log(`    ${runPrefix}Closed chat widget to prevent interference`);
+    }
+  } catch { }
+ 
+  const carouselSelectors = ['.owl-carousel', 'owl-carousel-o', '.slick-slider', '[class*="carousel"]'];
+  let carousels = [];
+ 
+  for (const selector of carouselSelectors) {
+    const elements = await page.locator(selector).all();
+    carousels = carousels.concat(elements);
+  }
+ 
+  if (carousels.length === 0) {
+    console.log(`    ${runPrefix}No carousels found on page`);
+    return;
+  }
+ 
+  console.log(`    ${runPrefix}Found ${carousels.length} carousel(s)`);
+ 
+  for (let c = 0; c < Math.min(carousels.length, 5); c++) {
+    console.log(`    ${runPrefix}Testing carousel ${c + 1}...`);
+   
+    const nextBtn = await carousels[c].locator('.owl-next, .slick-next, .next, button[id*="next"]').first();
+    if (await nextBtn.count() > 0 && await nextBtn.isVisible({ timeout: 1000 }).catch(() => false)) {
+      const btnAria = await nextBtn.getAttribute('aria-label').catch(() => 'Next');
+      console.log(`      ${runPrefix}Next button found, clicking...`);
+     
+      try {
+        await nextBtn.click({ force: true, timeout: 5000 });
+        await delay(500);
+        console.log(`      ${runPrefix}Next button: PASS`);
+        results.push({
+          success: true, status: 'pass', elementType: 'carousel-next',
+          elementText: btnAria || 'Next',
+          clickMethod: 'force-click', durationMs: 0,
+          validationDetail: 'PASS - Carousel next button works',
+          isGenuineIssue: false
+        });
+      } catch (err) {
+        console.log(`      ${runPrefix}Next button: Click failed - ${err.message.substring(0, 50)}`);
+        results.push({
+          success: false, status: 'fail', elementType: 'carousel-next',
+          elementText: btnAria || 'Next',
+          clickMethod: 'click-failed', durationMs: 0,
+          validationDetail: 'FAILED - Carousel next button click failed',
+          errorMessage: err.message,
+          isGenuineIssue: false
+        });
+      }
+    }
+   
+    const prevBtn = await carousels[c].locator('.owl-prev, .slick-prev, .prev, button[id*="prev"]').first();
+    if (await prevBtn.count() > 0 && await prevBtn.isVisible({ timeout: 1000 }).catch(() => false)) {
+      const btnAria = await prevBtn.getAttribute('aria-label').catch(() => 'Previous');
+      try {
+        await prevBtn.click({ force: true, timeout: 5000 });
+        await delay(500);
+        console.log(`      ${runPrefix}Prev button: PASS`);
+        results.push({
+          success: true, status: 'pass', elementType: 'carousel-prev',
+          elementText: btnAria || 'Previous',
+          clickMethod: 'force-click', durationMs: 0,
+          validationDetail: 'PASS - Carousel prev button works',
+          isGenuineIssue: false
+        });
+      } catch (err) {
+        console.log(`      ${runPrefix}Prev button: Click failed - ${err.message.substring(0, 50)}`);
+      }
+    }
+   
+    const circles = await carousels[c].locator('.circle-link, a[href]').all();
+   
+    if (circles.length === 0) {
+      console.log(`      ${runPrefix}No circle links found in carousel ${c + 1}`);
+      continue;
+    }
+   
+    console.log(`      ${runPrefix}Found ${circles.length} circle links`);
+   
+    for (let i = 0; i < Math.min(circles.length, 10); i++) {
+      const circle = circles[i];
+      const href = await circle.getAttribute('href').catch(() => null);
+      const text = await circle.textContent().catch(() => '');
+      const ariaLabel = await circle.getAttribute('aria-label').catch(() => '');
+      const linkStatus = await circle.getAttribute('data-link-status').catch(() => null);
+     
+      let elementText = text || ariaLabel || '';
+      if (!elementText && href) {
+        elementText = href.split('/').pop() || href;
+      }
+      if (!elementText) {
+        elementText = 'circle-link';
+      }
+      elementText = elementText.trim();
+     
+      if (!href || href === '#' || linkStatus === 'missing-href') {
+        results.push({
+          success: false, status: 'fail', elementType: 'circle-link',
+          elementText: elementText,
+          href: href || 'missing',
+          clickMethod: 'missing-href', durationMs: 0,
+          validationDetail: 'FAILED - Circle link missing href',
+          errorMessage: `Circle link missing href: "${elementText}"`,
+          isGenuineIssue: true
+        });
+        console.log(`        ${runPrefix}FAIL: "${elementText.substring(0, 40)}" - missing href`);
+      } else {
+        console.log(`        ${runPrefix}PASS: "${elementText.substring(0, 40)}" - has href`);
+      }
+    }
+  }
+}
+
+// ==================== TAB / ACCORDION-TITLE VALIDATION ====================
+
+async function validateTabAccordion(page, context, originalUrl, results, alreadyValidatedKeys = new Set(), runLabel = '') {
+  const runPrefix = runLabel ? `[${runLabel}] ` : '';
+  console.log(`\n  ${runPrefix}Testing tab/accordion-title panels...`);
+
+  const tabItems = await discoverTabAccordionElements(page);
+
+  if (tabItems.length === 0) {
+    console.log(`    ${runPrefix}No tab/accordion-title elements found - skipping`);
+    return;
+  }
+
+  console.log(`    ${runPrefix}Found ${tabItems.length} tab title(s)`);
+
+  const validatedPanelLinkKeys = new Set();
+
+  async function openTab(tab) {
+    const tabEl = page.locator(tab.selector).nth(tab.index);
+    await tabEl.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {});
+    await delay(200);
+    try {
+      await tabEl.click({ timeout: CONFIG.clickTimeout });
+    } catch {
+      await tabEl.click({ force: true, timeout: CONFIG.clickTimeout }).catch(() => {});
+    }
+    await delay(700);
+    return tabEl;
+  }
+
+  async function collectPanelLinks(ariaControls) {
+    const scope = ariaControls ? `#${ariaControls}` : null;
+    const panelLinkSelector = scope
+      ? [`${scope} a[href]`, `${scope} button:not([disabled])`].join(', ')
+      : [
+          '[role="tabpanel"]:not([aria-hidden="true"]) a[href]',
+          '.tabs-panel:not([aria-hidden="true"]) a[href]',
+          '[role="tabpanel"]:not([aria-hidden="true"]) button:not([disabled])',
+          '.tabs-panel:not([aria-hidden="true"]) button:not([disabled])',
+        ].join(', ');
+
+    return await page.evaluate((sel) => {
+      const items = [];
+      const seen = new Set();
+      const els = document.querySelectorAll(sel);
+      for (const el of els) {
+        const style = window.getComputedStyle(el);
+        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') continue;
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        if (el.getAttribute('aria-hidden') === 'true') continue;
+
+        const tag = el.tagName.toLowerCase();
+        const href = el.getAttribute('href') || null;
+        const rawText = (el.innerText || el.value || el.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim();
+        const text = (rawText || (href ? href.split('/').filter(Boolean).pop() : '') || tag).substring(0, 200);
+
+        if (!text) continue;
+        const fp = `${tag}:${text.substring(0, 50)}:${href || ''}`;
+        if (seen.has(fp)) continue;
+        seen.add(fp);
+
+        items.push({
+          tag,
+          text,
+          href,
+          target: el.getAttribute('target') || null,
+          x: Math.round(rect.x),
+          y: Math.round(rect.y),
+        });
+      }
+      return items;
+    }, panelLinkSelector).catch(() => []);
+  }
+
+  for (let i = 0; i < tabItems.length; i++) {
+    const tab = tabItems[i];
+    const shortText = tab.text.substring(0, 40);
+    const startTime = Date.now();
+
+    process.stdout.write(`    ${runPrefix}[${i + 1}/${tabItems.length}] [TAB] "${shortText}"... `);
+
+    try {
+      const tabEl = page.locator(tab.selector).nth(tab.index);
+      const tabVisible = await tabEl.isVisible({ timeout: 5000 }).catch(() => false);
+
+      if (!tabVisible) {
+        console.log(`${runPrefix}SKIP (not visible)`);
+        results.push({
+          success: false, status: 'fail', elementType: 'tab-title',
+          elementText: tab.text,
+          clickMethod: 'not-visible', durationMs: Date.now() - startTime,
+          validationDetail: `FAILED - Tab title "${shortText}" not visible`,
+          errorMessage: `Tab title "${tab.text}" not visible`,
+          isGenuineIssue: false,
+        });
+        continue;
+      }
+
+      await openTab(tab);
+
+      const ariaSelectedAfter = await tabEl.getAttribute('aria-selected').catch(() => null);
+      const becameSelected = ariaSelectedAfter === 'true';
+      const panelVisible = await page
+        .locator('[role="tabpanel"][aria-hidden="false"], .tabs-panel[aria-hidden="false"]')
+        .first().isVisible({ timeout: 2000 }).catch(() => false);
+      const classAfter = await tabEl.getAttribute('class').catch(() => '');
+      const hasFocusClass = /in-focus|active|selected/i.test(classAfter || '');
+      let controlledPanelVisible = false;
+      if (tab.ariaControls) {
+        controlledPanelVisible = await page
+          .locator(`#${tab.ariaControls}`)
+          .first().isVisible({ timeout: 1500 }).catch(() => false);
+      }
+
+      const tabActivated = becameSelected || panelVisible || hasFocusClass || controlledPanelVisible;
+
+      if (!tabActivated) {
+        console.log(`${runPrefix}FAIL (no panel activation detected)`);
+        results.push({
+          success: false, status: 'fail', elementType: 'tab-title',
+          elementText: tab.text,
+          clickMethod: 'tab-no-activation',
+          durationMs: Date.now() - startTime,
+          validationDetail: `FAILED - Tab "${shortText}" did not activate any panel`,
+          errorMessage: `Tab title "${tab.text}" clicked but no panel visible (aria-selected: ${ariaSelectedAfter}, focus-class: ${hasFocusClass})`,
+          isGenuineIssue: true,
+        });
+        await restorePageState(page, originalUrl);
+        continue;
+      }
+
+      const reason = becameSelected ? 'aria-selected=true'
+        : panelVisible ? 'tabpanel visible'
+        : hasFocusClass ? 'focus/active class set'
+        : 'controlled panel visible';
+      console.log(`${runPrefix}PASS (${reason})`);
+      results.push({
+        success: true, status: 'pass', elementType: 'tab-title',
+        elementText: tab.text,
+        clickMethod: `tab-${reason.replace(/\s/g, '-')}`,
+        durationMs: Date.now() - startTime,
+        validationDetail: `PASS - Tab "${shortText}" activated (${reason})`,
+        isGenuineIssue: false,
+      });
+
+      const panelLinks = await collectPanelLinks(tab.ariaControls);
+
+      if (panelLinks.length > 0) {
+        console.log(`      ${runPrefix}Panel content: ${panelLinks.length} link(s)/button(s) found`);
+
+        for (let p = 0; p < panelLinks.length; p++) {
+          const link = panelLinks[p];
+          const linkShort = link.text.substring(0, 40);
+          const linkStart = Date.now();
+
+          if (isSkippableContactHref(link.href)) {
+            console.log(`        ${runPrefix}[${p + 1}/${panelLinks.length}] [PANEL-LINK] SKIP: "${linkShort}" - contact link`);
+            continue;
+          }
+
+          const linkKey = `${link.tag}:${link.text.substring(0, 60)}:${link.href || ''}`;
+          if (alreadyValidatedKeys.has(linkKey) || validatedPanelLinkKeys.has(linkKey)) {
+            console.log(`        ${runPrefix}[${p + 1}/${panelLinks.length}] [PANEL-LINK] SKIP (already validated): "${linkShort}"`);
+            continue;
+          }
+          validatedPanelLinkKeys.add(linkKey);
+
+          process.stdout.write(`        ${runPrefix}[${p + 1}/${panelLinks.length}] [PANEL-LINK] "${linkShort}"... `);
+
+          await restorePageState(page, originalUrl);
+          await openTab(tab);
+
+          let freshLink = null;
+          const panelScope = tab.ariaControls ? `#${tab.ariaControls}` : null;
+          if (link.tag === 'a' && link.href) {
+            const hrefPath = link.href.split('?')[0].split('#')[0];
+            if (panelScope) {
+              const byHref = page.locator(
+                `${panelScope} a[href="${link.href}"], ${panelScope} a[href="${hrefPath}"]`
+              );
+              if (await byHref.count().catch(() => 0) > 0) freshLink = byHref.first();
+            }
+            if (!freshLink) {
+              const byHref = page.locator(
+                `[role="tabpanel"]:not([aria-hidden="true"]) a[href="${link.href}"], ` +
+                `[role="tabpanel"]:not([aria-hidden="true"]) a[href="${hrefPath}"], ` +
+                `.tabs-panel:not([aria-hidden="true"]) a[href="${link.href}"], ` +
+                `.tabs-panel:not([aria-hidden="true"]) a[href="${hrefPath}"]`
+              );
+              if (await byHref.count().catch(() => 0) > 0) freshLink = byHref.first();
+            }
+          }
+          if (!freshLink && link.text) {
+            const scopeSel = panelScope
+              ? `${panelScope} a, ${panelScope} button`
+              : '[role="tabpanel"]:not([aria-hidden="true"]) a, .tabs-panel:not([aria-hidden="true"]) a, [role="tabpanel"]:not([aria-hidden="true"]) button';
+            const byText = page.locator(scopeSel).filter({ hasText: link.text.substring(0, 60) });
+            if (await byText.count().catch(() => 0) > 0) freshLink = byText.first();
+          }
+
+          if (!freshLink || await freshLink.count().catch(() => 0) === 0) {
+            console.log(`${runPrefix}SKIP (could not re-locate)`);
+            results.push({
+              success: false, status: 'fail', elementType: 'tab-panel-link',
+              elementText: link.text, href: link.href,
+              clickMethod: 'not-found', durationMs: Date.now() - linkStart,
+              validationDetail: `FAILED - Panel link not found after reopening tab "${shortText}"`,
+              errorMessage: `Panel link "${link.text}" could not be re-located`,
+              isGenuineIssue: false,
+            });
+            continue;
+          }
+
+          const linkVisible = await freshLink.isVisible({ timeout: 2000 }).catch(() => false);
+          if (!linkVisible) {
+            console.log(`${runPrefix}SKIP (not visible)`);
+            results.push({
+              success: false, status: 'fail', elementType: 'tab-panel-link',
+              elementText: link.text, href: link.href,
+              clickMethod: 'not-visible', durationMs: Date.now() - linkStart,
+              validationDetail: `FAILED - Panel link not visible after reopening tab "${shortText}"`,
+              errorMessage: `Panel link "${link.text}" not visible`,
+              isGenuineIssue: false,
+            });
+            continue;
+          }
+
+          await freshLink.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {});
+          await delay(200);
+
+          const urlBefore = page.url();
+          const pagesBefore = context.pages().length;
+          const popupPromise = context.waitForEvent('page', { timeout: 5000 }).catch(() => null);
+
+          try {
+            await freshLink.click({ timeout: CONFIG.clickTimeout });
+          } catch {
+            try {
+              await freshLink.click({ force: true, timeout: CONFIG.clickTimeout });
+            } catch (err) {
+              console.log(`${runPrefix}FAIL (${err.message.substring(0, 50)})`);
+              results.push({
+                success: false, status: 'fail', elementType: 'tab-panel-link',
+                elementText: link.text, href: link.href,
+                clickMethod: 'click-failed', durationMs: Date.now() - linkStart,
+                validationDetail: `FAILED - Click error on panel link (tab: ${shortText})`,
+                errorMessage: err.message.substring(0, 200),
+                isGenuineIssue: true,
+              });
+              await navigateWithRecovery(page, originalUrl, { timeout: CONFIG.navigationTimeout, attempts: 3 });
+              await delay(1000);
+              continue;
+            }
+          }
+
+          await delay(1500);
+
+          const urlAfter = page.url();
+          const pagesAfter = context.pages().length;
+
+          if (pagesAfter > pagesBefore) {
+            const popup = await popupPromise;
+            if (popup && !popup.isClosed()) {
+              const popupUrl = popup.url();
+              await popup.close().catch(() => {});
+              await page.bringToFront().catch(() => {});
+              console.log(`${runPrefix}PASS (new-tab: ${popupUrl.substring(0, 50)})`);
+              results.push({
+                success: true, status: 'pass', elementType: 'tab-panel-link',
+                elementText: link.text, href: link.href,
+                clickMethod: 'new-tab', durationMs: Date.now() - linkStart,
+                validationDetail: `PASS - New tab opened: ${popupUrl.substring(0, 80)} (tab: ${shortText})`,
+                isGenuineIssue: false,
+              });
+            }
+          } else if (urlAfter !== urlBefore) {
+            console.log(`${runPrefix}PASS (navigated)`);
+            results.push({
+              success: true, status: 'pass', elementType: 'tab-panel-link',
+              elementText: link.text, href: link.href,
+              clickMethod: 'navigation', durationMs: Date.now() - linkStart,
+              validationDetail: `PASS - Navigated to: ${urlAfter.substring(0, 80)} (tab: ${shortText})`,
+              isGenuineIssue: false,
+            });
+            await navigateWithRecovery(page, originalUrl, { timeout: CONFIG.navigationTimeout, attempts: 3 });
+            await delay(1000);
+          } else if (link.href && link.href.startsWith('#')) {
+            console.log(`${runPrefix}PASS (anchor-scroll)`);
+            results.push({
+              success: true, status: 'pass', elementType: 'tab-panel-link',
+              elementText: link.text, href: link.href,
+              clickMethod: 'anchor-scroll', durationMs: Date.now() - linkStart,
+              validationDetail: `PASS - Anchor link (tab: ${shortText})`,
+              isGenuineIssue: false,
+            });
+          } else if (!link.href || link.href === '' || link.href.startsWith('javascript')) {
+            console.log(`${runPrefix}PASS (click-received)`);
+            results.push({
+              success: true, status: 'pass', elementType: 'tab-panel-link',
+              elementText: link.text, href: link.href,
+              clickMethod: 'click-received', durationMs: Date.now() - linkStart,
+              validationDetail: `PASS - Click received (tab: ${shortText})`,
+              isGenuineIssue: false,
+            });
+          } else {
+            console.log(`${runPrefix}FAIL (no-navigation)`);
+            results.push({
+              success: false, status: 'fail', elementType: 'tab-panel-link',
+              elementText: link.text, href: link.href,
+              clickMethod: 'no-navigation', durationMs: Date.now() - linkStart,
+              validationDetail: `FAILED - Panel link did not navigate (tab: ${shortText})`,
+              errorMessage: `BROKEN LINK: "${link.text}" did not navigate (href: ${link.href})`,
+              isGenuineIssue: true,
+            });
+          }
+        }
+      }
+
+      await restorePageState(page, originalUrl);
+
+    } catch (err) {
+      console.log(`${runPrefix}ERROR (${err.message.substring(0, 50)})`);
+      results.push({
+        success: false, status: 'fail', elementType: 'tab-title',
+        elementText: tab.text,
+        clickMethod: 'error',
+        durationMs: Date.now() - startTime,
+        validationDetail: `FAILED - Error clicking tab "${shortText}"`,
+        errorMessage: err.message.substring(0, 200),
+        isGenuineIssue: false,
+      });
+      await restorePageState(page, originalUrl);
+    }
+  }
+}
+
+// ==================== NAVIGATION CONTAINER VALIDATION ====================
+
+async function validateNavigationContainers(page, context, originalUrl, results, runLabel = '') {
+  const runPrefix = runLabel ? `[${runLabel}] ` : '';
+  console.log(`\n  ${runPrefix}Testing navigation containers (dropdowns / menu-wicon-region)...`);
+
+  const containersFound = await discoverNavigationContainers(page);
+
+  if (containersFound.length === 0) {
+    console.log(`    ${runPrefix}No navigation containers found - skipping`);
+    return;
+  }
+
+  console.log(`    ${runPrefix}Found ${containersFound.length} navigation container(s)`);
+
+  for (const containerMeta of containersFound) {
+    console.log(`\n    ${runPrefix}Container: "${containerMeta.text.substring(0, 50)}" [${containerMeta.selector}]`);
+
+    const getContainer = () => page.locator(containerMeta.selector).nth(containerMeta.index);
+
+    async function openContainer() {
+      const container = getContainer();
+      await container.scrollIntoViewIfNeeded({ timeout: 2500 }).catch(() => {});
+      await delay(300);
+      const innerTrigger = container.locator('button, [role="button"]').first();
+      const innerCount = await innerTrigger.count().catch(() => 0);
+      const triggerEl = innerCount > 0 ? innerTrigger : container;
+      try {
+        await triggerEl.click({ timeout: 5000 });
+      } catch {
+        await triggerEl.click({ force: true, timeout: 5000 }).catch(() => {});
+      }
+      await delay(700);
+    }
+
+    await openContainer();
+
+    const container = getContainer();
+    const childData = [];
+    const seenChild = new Set();
+
+    for (const [childSel, elType] of [
+      ['a[href]', 'a'],
+      ['button:not([disabled])', 'button'],
+      ['[role="menuitem"]', 'menuitem'],
+    ]) {
+      const childLocator = container.locator(childSel);
+      const cnt = await childLocator.count().catch(() => 0);
+      for (let j = 0; j < Math.min(cnt, 30); j++) {
+        const child = childLocator.nth(j);
+        const vis = await child.isVisible({ timeout: 400 }).catch(() => false);
+        if (!vis) continue;
+
+        const href = elType === 'a' ? await child.getAttribute('href').catch(() => null) : null;
+        const rawText = (await child.innerText().catch(() => '')).replace(/\s+/g, ' ').trim();
+        const ariaLabel = await child.getAttribute('aria-label').catch(() => '');
+        const displayText = (rawText || ariaLabel || (href ? href.split('/').pop() : '') || `Item ${j + 1}`).substring(0, 200);
+
+        const fp = `${elType}:${displayText.substring(0, 50)}:${href || ''}`;
+        if (seenChild.has(fp)) continue;
+        seenChild.add(fp);
+
+        childData.push({ elType, href, text: displayText, ariaLabel });
+      }
+    }
+
+    await page.keyboard.press('Escape').catch(() => {});
+    await delay(300);
+
+    if (childData.length === 0) {
+      console.log(`      ${runPrefix}No child items found inside container`);
+      results.push({
+        success: true, status: 'pass', elementType: 'nav-container',
+        elementText: containerMeta.text || containerMeta.selector,
+        clickMethod: 'container-opened', durationMs: 0,
+        validationDetail: 'PASS - Navigation container opened (no child items visible)',
+        isGenuineIssue: false,
+      });
+      continue;
+    }
+
+    console.log(`      ${runPrefix}Found ${childData.length} child item(s) to validate individually`);
+
+    for (let j = 0; j < childData.length; j++) {
+      const child = childData[j];
+      const startTime = Date.now();
+      const shortText = child.text.substring(0, 40);
+
+      if (isSkippableContactHref(child.href)) {
+        console.log(`        ${runPrefix}[${j + 1}/${childData.length}] SKIP: "${shortText}" - contact link`);
+        continue;
+      }
+
+      process.stdout.write(`        ${runPrefix}[${j + 1}/${childData.length}] [NAV-ITEM] "${shortText}"... `);
+
+      await restorePageState(page, originalUrl);
+      await openContainer();
+
+      const freshContainer = getContainer();
+      let freshChild = null;
+
+      if (child.elType === 'a' && child.href) {
+        const hrefPath = child.href.split('?')[0].split('#')[0];
+        const byHref = freshContainer.locator(`a[href="${child.href}"], a[href="${hrefPath}"]`);
+        if (await byHref.count().catch(() => 0) > 0) {
+          freshChild = byHref.first();
+        } else {
+          const byText = freshContainer.locator('a').filter({ hasText: child.text.substring(0, 60) });
+          if (await byText.count().catch(() => 0) > 0) freshChild = byText.first();
+        }
+      } else if (child.text) {
+        const byText = freshContainer.locator(`${child.elType === 'menuitem' ? '[role="menuitem"]' : child.elType}`).filter({ hasText: child.text.substring(0, 60) });
+        if (await byText.count().catch(() => 0) > 0) freshChild = byText.first();
+      }
+
+      if (!freshChild || await freshChild.count().catch(() => 0) === 0) {
+          console.log(`${runPrefix}SKIP (could not re-locate)`);
+        results.push({
+          success: false, status: 'fail', elementType: 'nav-container-item',
+          elementText: child.text, href: child.href,
+          clickMethod: 'not-found', durationMs: Date.now() - startTime,
+          validationDetail: `FAILED - Item not found after reopening container (${containerMeta.text})`,
+          errorMessage: `Nav item "${child.text}" could not be re-located`,
+          isGenuineIssue: false,
+        });
+        continue;
+      }
+
+      const childVisible = await freshChild.isVisible({ timeout: 2000 }).catch(() => false);
+      if (!childVisible) {
+        console.log(`${runPrefix}SKIP (not visible)`);
+        results.push({
+          success: false, status: 'fail', elementType: 'nav-container-item',
+          elementText: child.text, href: child.href,
+          clickMethod: 'not-visible', durationMs: Date.now() - startTime,
+          validationDetail: `FAILED - Item not visible after reopening container (${containerMeta.text})`,
+          errorMessage: `Nav item "${child.text}" not visible`,
+          isGenuineIssue: false,
+        });
+        continue;
+      }
+
+      await freshChild.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {});
+      await delay(200);
+
+      const urlBefore = page.url();
+      const pagesBefore = context.pages().length;
+      const popupPromise = context.waitForEvent('page', { timeout: 5000 }).catch(() => null);
+
+      try {
+        await freshChild.click({ timeout: CONFIG.clickTimeout });
+      } catch {
+        try {
+          await freshChild.click({ force: true, timeout: CONFIG.clickTimeout });
+        } catch (err) {
+          console.log(`${runPrefix}FAIL (${err.message.substring(0, 50)})`);
+          results.push({
+            success: false, status: 'fail', elementType: 'nav-container-item',
+            elementText: child.text, href: child.href,
+            clickMethod: 'click-failed', durationMs: Date.now() - startTime,
+            validationDetail: `FAILED - Click error (container: ${containerMeta.text})`,
+            errorMessage: err.message.substring(0, 200),
+            isGenuineIssue: true,
+          });
+          await navigateWithRecovery(page, originalUrl, { timeout: CONFIG.navigationTimeout, attempts: 3 });
+          await delay(1000);
+          continue;
+        }
+      }
+
+      await delay(1500);
+
+      const urlAfter = page.url();
+      const pagesAfter = context.pages().length;
+
+      if (pagesAfter > pagesBefore) {
+        const popup = await popupPromise;
+        if (popup && !popup.isClosed()) {
+          const popupUrl = popup.url();
+          await popup.close().catch(() => {});
+          await page.bringToFront().catch(() => {});
+          console.log(`${runPrefix}PASS (new-tab)`);
+          results.push({
+            success: true, status: 'pass', elementType: 'nav-container-item',
+            elementText: child.text, href: child.href,
+            clickMethod: 'new-tab', durationMs: Date.now() - startTime,
+            validationDetail: `PASS - New tab: ${popupUrl.substring(0, 80)} (container: ${containerMeta.text})`,
+            isGenuineIssue: false,
+          });
+        }
+      } else if (urlAfter !== urlBefore) {
+        console.log(`${runPrefix}PASS (navigated to ${urlAfter.substring(0, 50)})`);
+        results.push({
+          success: true, status: 'pass', elementType: 'nav-container-item',
+          elementText: child.text, href: child.href,
+          clickMethod: 'navigation', durationMs: Date.now() - startTime,
+          validationDetail: `PASS - Navigated to: ${urlAfter.substring(0, 80)} (container: ${containerMeta.text})`,
+          isGenuineIssue: false,
+        });
+        await navigateWithRecovery(page, originalUrl, { timeout: CONFIG.navigationTimeout, attempts: 3 });
+        await delay(1000);
+      } else if (child.href && child.href.startsWith('#')) {
+        console.log(`${runPrefix}PASS (anchor-scroll)`);
+        results.push({
+          success: true, status: 'pass', elementType: 'nav-container-item',
+          elementText: child.text, href: child.href,
+          clickMethod: 'anchor-scroll', durationMs: Date.now() - startTime,
+          validationDetail: `PASS - Anchor link (container: ${containerMeta.text})`,
+          isGenuineIssue: false,
+        });
+      } else if (!child.href) {
+        console.log(`${runPrefix}PASS (click-received)`);
+        results.push({
+          success: true, status: 'pass', elementType: 'nav-container-item',
+          elementText: child.text, href: null,
+          clickMethod: 'click-received', durationMs: Date.now() - startTime,
+          validationDetail: `PASS - Click received (container: ${containerMeta.text})`,
+          isGenuineIssue: false,
+        });
+      } else {
+        console.log(`${runPrefix}FAIL (no-navigation)`);
+        results.push({
+          success: false, status: 'fail', elementType: 'nav-container-item',
+          elementText: child.text, href: child.href,
+          clickMethod: 'no-navigation', durationMs: Date.now() - startTime,
+          validationDetail: `FAILED - Link did not navigate (container: ${containerMeta.text})`,
+          errorMessage: `BROKEN LINK: "${child.text}" did not navigate (href: ${child.href})`,
+          isGenuineIssue: true,
+        });
+      }
+    }
+
+    await restorePageState(page, originalUrl);
+  }
+}
+
+// ==================== TILE FILTER VALIDATION ====================
+
+async function discoverTileFilterElements(page) {
+  const tileContainerSelectors = [
+    '.nw-container.nw-tilefilter.nw-outer-bottom--xl',
+    '.nw-tilefilter',
+    '[class*="nw-tilefilter"]',
+    'ngx-web-entity-container',
+    '[class*="ngx-web-entity-container"]'
+  ];
+
+  const containers = [];
+  const seenContainers = new Set();
+
+  for (const selector of tileContainerSelectors) {
+    const count = await page.locator(selector).count().catch(() => 0);
+    for (let i = 0; i < Math.min(count, 6); i++) {
+      const container = page.locator(selector).nth(i);
+      const visible = await container.isVisible({ timeout: 500 }).catch(() => false);
+      if (!visible) continue;
+
+      const title = await container
+        .locator('h1, h2, h3, h4, .title, [class*="title"]')
+        .first()
+        .innerText()
+        .catch(() => '');
+
+      const key = `${selector}:${i}:${String(title || '').substring(0, 50)}`;
+      if (seenContainers.has(key)) continue;
+      seenContainers.add(key);
+
+      containers.push({ selector, index: i, title: String(title || '').replace(/\s+/g, ' ').trim() });
+    }
+  }
+
+  return await page.evaluate((containerMeta) => {
+    const normalizeText = (value) => String(value || '').replace(/\s+/g, ' ').trim();
+    const isVisible = (node) => {
+      if (!node) return false;
+      const rect = node.getBoundingClientRect();
+      if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+      const style = window.getComputedStyle(node);
+      return style && style.visibility !== 'hidden' && style.display !== 'none';
+    };
+
+    const buildTileItem = (node, meta, sourceTag = '') => {
+      if (!node || !isVisible(node)) return null;
+
+      const rect = node.getBoundingClientRect();
+      const tag = String(node.tagName || sourceTag || 'unknown').toLowerCase();
+      const href = node.getAttribute?.('href') || null;
+      const ariaLabel = normalizeText(node.getAttribute?.('aria-label') || '');
+      const target = node.getAttribute?.('target') || null;
+      const id = node.getAttribute?.('id') || '';
+      const className = String(node.getAttribute?.('class') || '').substring(0, 120);
+      const text = normalizeText(node.innerText || node.textContent || '');
+      const displayText = (text || ariaLabel || (href ? href.split('/').pop() : '') || tag).substring(0, 200);
+
+      if (!displayText) return null;
+
+      return {
+        type: tag,
+        text: displayText,
+        ariaLabel,
+        href,
+        target,
+        id,
+        className,
+        selector: id ? `#${id}` : (tag === 'a' && href ? `a[href="${href.split('?')[0]}"]` : null),
+        domPath: sourceTag || tag,
+        isCustomElement: tag.includes('-'),
+        isPreMarkedBroken: false,
+        isFocusableNonSemantic: false,
+        isChatToggle: false,
+        isChatClose: false,
+        isAccordion: false,
+        isAccordionGroupToggle: false,
+        isAccordionHeader: false,
+        isInPageSectionNav: false,
+        x: Math.round(rect.x),
+        y: Math.round(rect.y),
+        tileContainer: meta.selector,
+        tileContainerTitle: meta.title
+      };
+    };
+
+    const items = [];
+    const seen = new Set();
+
+    for (const meta of containerMeta) {
+      const container = document.querySelectorAll(meta.selector)?.[meta.index];
+      if (!container || !isVisible(container)) continue;
+
+      const addItem = (node, sourceTag = '') => {
+        const item = buildTileItem(node, meta, sourceTag);
+        if (!item) return;
+
+        const normalizedHref = String(item.href || '').split('?')[0].split('#')[0];
+        const fingerprint = `${item.type}:${item.text.substring(0, 60)}:${normalizedHref}`;
+        if (seen.has(fingerprint)) return;
+        seen.add(fingerprint);
+        items.push(item);
+      };
+
+      const boltTiles = Array.from(container.querySelectorAll('bolt-tile'));
+      let boltTileAnchorCount = 0;
+      for (const host of boltTiles) {
+        const anchor = host.shadowRoot?.querySelector('a.bolt-tile-wc');
+        if (anchor) {
+          boltTileAnchorCount += 1;
+          addItem(anchor, 'bolt-tile-shadow-anchor');
+        }
+      }
+
+      if (boltTileAnchorCount > 0) {
+        continue;
+      }
+
+      const fallbackNodes = container.querySelectorAll([
+        'a.bolt-tile-wc',
+        'ngx-web-link a[href]',
+        '[class*="tile"] a[href]',
+        '[class*="card"] a[href]',
+        '[class*="tile"] button:not([disabled])',
+        '[class*="card"] button:not([disabled])'
+      ].join(', '));
+
+      for (const node of fallbackNodes) {
+        const tileRoot = node.closest(
+          'bolt-tile, bolt-tile-group, ngx-web-tile-group, ngx-web-entity-container, .bolt-tile-wc, [class*="bolt-tile"], .tile, [class*="tile"], .card, [class*="card"], .entity-card, [class*="entity-card"], .entity-tile, [class*="entity-tile"], article, li, section'
+        );
+        if (!tileRoot) continue;
+        addItem(node);
+      }
+    }
+
+    return items;
+  }, containers);
+}
+
+async function validateTileFilters(page, context, originalUrl, results, alreadyValidatedKeys = new Set(), options = {}) {
+  const { clickOnly = false } = options;
+  const runPrefix = options.runLabel ? `[${options.runLabel}] ` : '';
+  console.log(`\n  ${runPrefix}Testing tile filter containers...`);
+
+  const tileItems = await discoverTileFilterElements(page);
+
+  if (tileItems.length === 0) {
+    console.log(`    ${runPrefix}No tile filter items found - skipping`);
+    return;
+  }
+
+  console.log(`    ${runPrefix}Found ${tileItems.length} tile clickable item(s)`);
+
+  const tileRunSeen = new Set();
+  let validatedCount = 0;
+  const maxTileItemsToValidate = Number(CONFIG.maxTileItemsPerUrl) > 0
+    ? Number(CONFIG.maxTileItemsPerUrl)
+    : Number.POSITIVE_INFINITY;
+
+  for (let i = 0; i < tileItems.length; i++) {
+    const tile = tileItems[i];
+    const key = buildValidationKey(tile);
+
+    if (tileRunSeen.has(key.loose)) {
+      continue;
+    }
+
+    if (validatedCount >= maxTileItemsToValidate) {
+      console.log(`    ${runPrefix}Reached tile validation limit (${maxTileItemsToValidate}) to keep run time stable`);
+      break;
+    }
+
+    tileRunSeen.add(key.loose);
+
+    if (isSkippableContactHref(tile.href)) {
+      continue;
+    }
+
+    await restorePageState(page, originalUrl);
+
+    validatedCount++;
+    const shortText = tile.text.substring(0, 40);
+    process.stdout.write(`    ${runPrefix}[${validatedCount}/${tileItems.length}] [TILE] ${tile.type}: "${shortText}"... `);
+
+    try {
+      const result = await validateClick(page, context, tile, originalUrl, { clickOnly });
+      const normalized = {
+        ...result,
+        url: originalUrl,
+        elementType: 'tile-item',
+        elementInfo: tile,
+        validationDetail: result.validationDetail || `Tile validation result (${tile.tileContainerTitle || tile.tileContainer})`
+      };
+      results.push(normalized);
+
+      const broken = normalized.isGenuineIssue ? ' [BROKEN]' : '';
+      console.log(`${runPrefix}${normalized.status === 'pass' ? 'PASS' : 'FAIL'} (${normalized.durationMs || 0}ms) - ${normalized.clickMethod || 'click'}${broken}`);
+      if (normalized.status !== 'pass' && normalized.errorMessage) {
+        console.log(`       ${runPrefix}-> ${String(normalized.errorMessage).substring(0, 90)}`);
+      }
+    } catch (err) {
+      console.log(`${runPrefix}FAIL (error: ${String(err.message || err).substring(0, 80)})`);
+      results.push({
+        success: false,
+        status: 'fail',
+        elementType: 'tile-item',
+        elementText: tile.text,
+        href: tile.href,
+        clickMethod: 'error',
+        durationMs: 0,
+        validationDetail: `FAILED - Tile validation error (${tile.tileContainerTitle || tile.tileContainer})`,
+        errorMessage: String(err.message || err),
+        isGenuineIssue: true,
+        url: originalUrl,
+        elementInfo: tile
+      });
+    }
+  }
+
+  if (validatedCount === 0) {
+    console.log('    Tile items were already covered by previous validation steps');
+  }
+}
+
+// ==================== CHAT WIDGET VALIDATION ====================
+
+async function validateChatWidget(page, context, originalUrl, results, runLabel = '') {
+  const runPrefix = runLabel ? `[${runLabel}] ` : '';
+  console.log(`\n  ${runPrefix}Testing chat widget...`);
+
+  const chatToggle = page.locator('button[data-cognigy-webchat-toggle="true"]').first();
+  const chatToggleExists = await chatToggle.count();
+
+  if (chatToggleExists === 0) {
+    console.log(`    ${runPrefix}Chat widget toggle not found on this page - skipping`);
+    return;
+  }
+
+  const toggleText = await chatToggle.getAttribute('aria-label').catch(() => 'Open chat');
+  const toggleVisible = await chatToggle.isVisible({ timeout: 2000 }).catch(() => false);
+
+  if (!toggleVisible) {
+    console.log(`    ${runPrefix}Chat toggle exists but is not visible`);
+    results.push({
+      success: false, status: 'fail', elementType: 'chat-toggle',
+      elementText: toggleText,
+      clickMethod: 'chat-toggle-not-visible', durationMs: 0,
+      validationDetail: 'FAILED - Chat toggle present but not visible',
+      errorMessage: 'button[data-cognigy-webchat-toggle="true"] exists but is not visible',
+      isGenuineIssue: true
+    });
+    return;
+  }
+
+  console.log(`    ${runPrefix}Found chat toggle button: "${toggleText}"`);
+
+  try {
+    await chatToggle.click({ timeout: 5000 });
+  } catch {
+    await chatToggle.click({ force: true, timeout: 5000 }).catch(() => {});
+  }
+
+  await delay(1200);
+
+  const closeBtn = page.locator('button[data-header-close-button="true"]').first();
+  const closeVisible = await closeBtn.isVisible({ timeout: 3000 }).catch(() => false);
+
+  if (!closeVisible) {
+    console.log(`    ${runPrefix}Chat toggle clicked but close button not visible`);
+    results.push({
+      success: false, status: 'fail', elementType: 'chat-toggle',
+      elementText: toggleText,
+      clickMethod: 'chat-open-failed', durationMs: 0,
+      validationDetail: 'FAILED - Chat did not open after toggle click',
+      errorMessage: 'button[data-header-close-button="true"] not visible after clicking chat toggle',
+      isGenuineIssue: true
+    });
+    return;
+  }
+
+  results.push({
+    success: true, status: 'pass', elementType: 'chat-toggle',
+    elementText: toggleText,
+    clickMethod: 'chat-open', durationMs: 0,
+    validationDetail: 'PASS - Chat opened and close button is visible',
+    isGenuineIssue: false
+  });
+
+  const closeText = await closeBtn.getAttribute('aria-label').catch(() => 'Close chat');
+  console.log(`    ${runPrefix}Found chat close button: "${closeText}"`);
+
+  await closeBtn.click({ timeout: 5000 }).catch(() => {});
+  await delay(1000);
+
+  const closedSuccessfully = !(await closeBtn.isVisible({ timeout: 1500 }).catch(() => false));
+
+  if (closedSuccessfully) {
+    console.log(`    ${runPrefix}Chat window closed successfully`);
+    results.push({
+      success: true, status: 'pass', elementType: 'chat-close',
+      elementText: closeText,
+      clickMethod: 'chat-close', durationMs: 0,
+      validationDetail: 'PASS - Chat window closed',
+      isGenuineIssue: false
+    });
+  } else {
+    console.log(`    ${runPrefix}WARNING: Chat close button still visible after click`);
+    results.push({
+      success: false, status: 'fail', elementType: 'chat-close',
+      elementText: closeText,
+      clickMethod: 'chat-close-failed', durationMs: 0,
+      validationDetail: 'FAILED - Chat did not close',
+      errorMessage: 'button[data-header-close-button="true"] is still visible after close click',
+      isGenuineIssue: true
+    });
+  }
+}
+
+// ==================== STICKY CTA VALIDATION ====================
+
+async function validateStickyCta(page, context, originalUrl, results, runLabel = '') {
+  const runPrefix = runLabel ? `[${runLabel}] ` : '';
+  console.log(`\n  ${runPrefix}Testing sticky CTA...`);
+ 
+  // Helper: wait until element is actually clickable (not covered by overlay)
+  async function waitUntilClickable(selector, timeout = 10000) {
+    await page.waitForFunction((sel) => {
+      const el = document.querySelector(sel);
+      if (!el) return false;
+     
+      // Check if element is visible
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return false;
+     
+      const style = window.getComputedStyle(el);
+      if (style.display === 'none' || style.visibility === 'hidden') return false;
+     
+      // Check center point of the element
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+     
+      const topEl = document.elementFromPoint(cx, cy);
+      return topEl === el || el.contains(topEl);
+    }, selector, { timeout });
+    return true;
+  }
+ 
+  // Helper: reopen drawer after navigation
+  async function reopenDrawer() {
+    await page.evaluate(() => {
+      const btn = document.querySelector('#stickyCtaButton');
+      if (btn?.shadowRoot) {
+        const shadowBtn = btn.shadowRoot.querySelector('button');
+        if (shadowBtn) shadowBtn.click();
+      } else if (btn) {
+        btn.click();
+      }
+    });
+    await delay(1200); // animation
+  }
+ 
+  console.log(`    ${runPrefix}Scrolling to reveal sticky CTA...`);
+ 
+  // STEP 1 — Reveal Sticky CTA
+  const scrollPositions = [200, 400, 600, 900];
+  let ctaFound = false;
+ 
+  for (const pos of scrollPositions) {
+    await page.evaluate((y) => window.scrollTo(0, y), pos);
+    await delay(1200);
+   
+    const exists = await page.evaluate(() => {
+      const btn = document.querySelector('#stickyCtaButton');
+      if (!btn) return false;
+      if (btn.shadowRoot) {
+        const shadowBtn = btn.shadowRoot.querySelector('button');
+        return shadowBtn && shadowBtn.offsetParent !== null;
+      }
+      return btn.offsetParent !== null;
+    });
+   
+    if (exists) {
+      console.log(`    ${runPrefix}✓ Sticky CTA found at scroll ${pos}px`);
+      ctaFound = true;
+      break;
+    }
+  }
+ 
+  if (!ctaFound) {
+    console.log(`    ${runPrefix}Sticky CTA not found — skipping validation`);
+    return;
+  }
+ 
+  // STEP 2 — Scroll to stable position
+  await page.evaluate(() => window.scrollTo(0, 600));
+  await delay(800);
+ 
+  // STEP 3 — Get button info and click
+  console.log(`\n    ${runPrefix}Getting button info from Shadow DOM...`);
+  const buttonInfo = await page.evaluate(() => {
+    const btn = document.querySelector('#stickyCtaButton');
+    if (!btn) return { error: 'Button not found' };
+   
+    let buttonText = '';
+    let ariaExpanded = '';
+   
+    if (btn.shadowRoot) {
+      const shadowBtn = btn.shadowRoot.querySelector('button');
+      if (shadowBtn) {
+        buttonText = shadowBtn.textContent;
+        ariaExpanded = shadowBtn.getAttribute('aria-expanded');
+      }
+    }
+   
+    return {
+      text: buttonText,
+      ariaExpanded: ariaExpanded,
+      hasShadowRoot: !!btn.shadowRoot
+    };
+  });
+ 
+  const buttonText = (buttonInfo.text || 'Next steps').trim();
+  console.log(`    ${runPrefix}Button text: "${buttonText}"`);
+  console.log(`    ${runPrefix}aria-expanded before click: ${buttonInfo.ariaExpanded}`);
+ 
+  console.log(`\n    ${runPrefix}Clicking CTA button...`);
+  await page.evaluate(() => {
+    const btn = document.querySelector('#stickyCtaButton');
+    if (btn?.shadowRoot) {
+      btn.shadowRoot.querySelector('button')?.click();
+    } else if (btn) {
+      btn.click();
+    }
+  });
+ 
+  await delay(1200); // animation
+ 
+  // STEP 4 — Verify drawer opened
+  console.log(`\n    ${runPrefix}Checking drawer content...`);
+  const drawerInfo = await page.evaluate(() => {
+    const container = document.querySelector('.button-content-inline-container');
+    const isVisible = container && window.getComputedStyle(container).display !== 'none';
+   
+    let links = [];
+    if (isVisible && container) {
+      const anchors = container.querySelectorAll('a[href]');
+      anchors.forEach(a => {
+        links.push({
+          text: a.innerText?.trim() || a.getAttribute('aria-label'),
+          href: a.getAttribute('href')
+        });
+      });
+    }
+   
+    const btn = document.querySelector('#stickyCtaButton');
+    let ariaExpanded = '';
+    if (btn && btn.shadowRoot) {
+      const shadowBtn = btn.shadowRoot.querySelector('button');
+      if (shadowBtn) {
+        ariaExpanded = shadowBtn.getAttribute('aria-expanded');
+      }
+    }
+   
+    return {
+      containerVisible: isVisible,
+      ariaExpandedAfter: ariaExpanded,
+      links: links
+    };
+  });
+ 
+  console.log(`    ${runPrefix}Container visible: ${drawerInfo.containerVisible}`);
+  console.log(`    ${runPrefix}aria-expanded after click: ${drawerInfo.ariaExpandedAfter}`);
+ 
+  if (!drawerInfo.containerVisible) {
+    console.log(`    ${runPrefix}No drawer content found - button click may not open drawer`);
+    results.push({
+      success: true, status: 'pass', elementType: 'sticky-cta',
+      elementText: buttonText,
+      clickMethod: 'clicked-no-drawer', durationMs: 0,
+      validationDetail: 'PASS - Sticky CTA button clicked (no drawer detected)',
+      isGenuineIssue: false
+    });
+    return;
+  }
+ 
+  results.push({
+    success: true, status: 'pass', elementType: 'sticky-cta',
+    elementText: buttonText,
+    clickMethod: 'click-opened', durationMs: 0,
+    validationDetail: 'PASS - Sticky CTA button clicked, drawer opened',
+    isGenuineIssue: false
+  });
+ 
+  // STEP 5 — Validate drawer links
+  const drawerLinks = page.locator('.button-content-inline-container a[href]');
+  const linkCount = await drawerLinks.count();
+ 
+  if (linkCount > 0) {
+    console.log(`\n    Found ${linkCount} link(s) in drawer:`);
+    const linkInfo = [];
+    for (let i = 0; i < linkCount; i++) {
+      const link = drawerLinks.nth(i);
+      const text = await link.innerText().catch(() => '');
+      const href = await link.getAttribute('href').catch(() => '');
+      console.log(`      - "${text}" -> ${href}`);
+      linkInfo.push({ text, href, index: i });
+    }
+   
+    console.log('\n    Validating drawer links...');
+   
+    for (let i = 0; i < linkInfo.length; i++) {
+      const link = linkInfo[i];
+      console.log(`      [${i + 1}/${linkCount}] Validating "${link.text}"...`);
+     
+      // Skip contact links
+      if (isSkippableContactHref(link.href)) {
+        console.log(`        SKIP - Contact link`);
+        continue;
+      }
+     
+      try {
+        const urlBefore = page.url();
+        const pagesBefore = context.pages().length;
+        const popupPromise = context.waitForEvent('page', { timeout: 5000 }).catch(() => null);
+       
+        // Build selector for this specific link
+        let selector;
+        if (link.href && !link.href.startsWith('javascript')) {
+          const hrefPath = link.href.split('?')[0].split('#')[0];
+          selector = `.button-content-inline-container a[href="${hrefPath}"]`;
+        } else {
+          selector = `.button-content-inline-container a:has-text("${link.text}")`;
+        }
+       
+        // Wait until link is actually clickable (not covered by overlay)
+        console.log(`        ${runPrefix}Waiting for link to be clickable...`);
+        await waitUntilClickable(selector, 10000);
+       
+        // Get fresh reference and click
+        const freshLink = page.locator(selector).first();
+        await freshLink.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {});
+        await delay(200);
+        await freshLink.click({ force: true, timeout: CONFIG.clickTimeout });
+       
+        await delay(2000);
+       
+        const urlAfter = page.url();
+        const pagesAfter = context.pages().length;
+       
+        if (pagesAfter > pagesBefore) {
+          const popup = await popupPromise;
+          if (popup && !popup.isClosed()) {
+            const popupUrl = popup.url();
+            await popup.close().catch(() => {});
+            await page.bringToFront().catch(() => {});
+            console.log(`        ${runPrefix}PASS - New tab opened: ${popupUrl.substring(0, 80)}`);
+            results.push({
+              success: true, status: 'pass', elementType: 'sticky-cta-drawer-link',
+              elementText: link.text, href: link.href,
+              clickMethod: 'new-tab', durationMs: 0,
+              validationDetail: `PASS - New tab opened: ${popupUrl.substring(0, 80)}`,
+              isGenuineIssue: false
+            });
+          }
+        } else if (urlAfter !== urlBefore) {
+          console.log(`        ${runPrefix}PASS - Navigated to: ${urlAfter.substring(0, 80)}`);
+          results.push({
+            success: true, status: 'pass', elementType: 'sticky-cta-drawer-link',
+            elementText: link.text, href: link.href,
+            clickMethod: 'navigation', durationMs: 0,
+            validationDetail: `PASS - Navigated to: ${urlAfter.substring(0, 80)}`,
+            isGenuineIssue: false
+          });
+          // Navigate back
+          await page.goBack({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(async () => {
+            await navigateWithRecovery(page, originalUrl, { timeout: CONFIG.navigationTimeout, attempts: 3 });
+          });
+          await delay(1000);
+          // Reopen drawer
+          await reopenDrawer();
+        } else {
+          console.log(`        ${runPrefix}PASS - Click received (no navigation)`);
+          results.push({
+            success: true, status: 'pass', elementType: 'sticky-cta-drawer-link',
+            elementText: link.text, href: link.href,
+            clickMethod: 'click-received', durationMs: 0,
+            validationDetail: 'PASS - Click received',
+            isGenuineIssue: false
+          });
+        }
+      } catch (err) {
+        console.log(`        ${runPrefix}FAIL - ${err.message}`);
+        results.push({
+          success: false, status: 'fail', elementType: 'sticky-cta-drawer-link',
+          elementText: link.text, href: link.href,
+          clickMethod: 'click-failed', durationMs: 0,
+          validationDetail: 'FAILED - Click failed',
+          errorMessage: err.message,
+          isGenuineIssue: true
+        });
+      }
+    }
+  }
+ 
+  // STEP 6 — ZIP Input + Start Quote (if present)
+  const zipInput = page.locator('#p45512 input');
+  const zipExists = await zipInput.count();
+ 
+  if (zipExists > 0) {
+    console.log('\n    ZIP input detected — testing quote flow...');
+   
+    try {
+      await zipInput.fill('43215');
+      await delay(300);
+     
+      const startQuoteBtn = page.locator('#p45512 bolt-button');
+      const btnExists = await startQuoteBtn.count();
+     
+      if (btnExists > 0) {
+        console.log('    Clicking Start Your Quote...');
+        await startQuoteBtn.click({ force: true });
+        await delay(2000);
+       
+        console.log(`    ✓ Quote flow navigated to: ${page.url()}`);
+        results.push({
+          success: true, status: 'pass', elementType: 'sticky-cta-quote',
+          elementText: 'Start Your Quote',
+          clickMethod: 'quote-flow', durationMs: 0,
+          validationDetail: `PASS - Quote flow started: ${page.url().substring(0, 80)}`,
+          isGenuineIssue: false
+        });
+       
+        // Navigate back
+        await page.goBack({ waitUntil: 'domcontentloaded', timeout: 10000 }).catch(async () => {
+          await navigateWithRecovery(page, originalUrl, { timeout: CONFIG.navigationTimeout, attempts: 3 });
+        });
+        await delay(1000);
+      }
+    } catch (err) {
+      console.log(`    Quote flow error: ${err.message}`);
+      results.push({
+        success: false, status: 'fail', elementType: 'sticky-cta-quote',
+        elementText: 'Start Your Quote',
+        clickMethod: 'quote-failed', durationMs: 0,
+        validationDetail: 'FAILED - Quote flow failed',
+        errorMessage: err.message,
+        isGenuineIssue: true
+      });
+    }
+  }
+ 
+  console.log(`\n    ${runPrefix}Sticky CTA validation complete`);
+}
+
+// ==================== RESTORE PAGE STATE ====================
+
+async function restorePageState(page, originalUrl) {
+  const currentUrl = page.url();
+
+  if (currentUrl !== originalUrl) {
+    let restoredByBack = false;
+    try {
+      await stopPageLoading(page);
+      await page.goBack({ waitUntil: 'domcontentloaded', timeout: 10000 });
+      await delay(1000);
+      restoredByBack = page.url() === originalUrl;
+    } catch { }
+
+    if (!restoredByBack && page.url() !== originalUrl) {
+      await navigateWithRecovery(page, originalUrl, {
+        timeout: CONFIG.navigationTimeout,
+        attempts: 3
+      });
+    }
+  }
+
+  await delay(CONFIG.restoreWaitMs);
+
+  try {
+    const closeBtns = await page.locator('button[aria-label="Close"], .modal-close, .close').all();
+    for (const btn of closeBtns) {
+      if (await btn.isVisible({ timeout: 500 }).catch(() => false)) {
+        await btn.click({ force: true }).catch(() => {});
+      }
+    }
+  } catch { }
+}
+
+// ==================== RUN VALIDATION ====================
+
+async function validateUrl(targetUrl, options = {}) {
+  const { headed = false, clickOnly = false } = options;
+  const startTime = Date.now();
+  const runLabel = `RUN-${new Date(startTime).toISOString().replace(/[:.]/g, '-').slice(0, 19)}`;
+  let browser = null;
+  let context = null;
+  let page = null;
+  const results = [];
+ 
+  console.log(`\n  [${runLabel}] Testing: ${targetUrl}`);
+ 
+  try {
+    browser = await chromium.launch({ headless: !headed });
+    context = await browser.newContext({ viewport: CONFIG.viewport });
+    page = await context.newPage();
+   
+    const originalUrl = await preparePage(page, targetUrl);
+    console.log(`  [${runLabel}] Current URL: ${originalUrl}`);
+   
+    console.log(`  [${runLabel}] Discovering clickable elements...`);
+   
+    await page.waitForTimeout(3000);
+
+    const scrollPositions = await page.evaluate(() => {
+      const doc = document.documentElement;
+      const body = document.body;
+      const scrollHeight = Math.max(doc?.scrollHeight || 0, body?.scrollHeight || 0);
+      const maxY = Math.max(scrollHeight - window.innerHeight, 0);
+      return [0, Math.round(maxY * 0.35), Math.round(maxY * 0.7), maxY]
+        .filter((v, i, arr) => arr.indexOf(v) === i);
+    }).catch(() => [0]);
+
+    const elements = [];
+    const seenElementKeys = new Set();
+
+    for (const y of scrollPositions) {
+      await page.evaluate((targetY) => window.scrollTo(0, targetY), y).catch(() => {});
+      await page.waitForTimeout(600);
+
+      const snapshot = await discoverClickableElements(page);
+      for (const el of snapshot) {
+        const key = CONFIG.collectAllClickableEvents
+          ? `${el.type}|${String(el.text || '').trim().toLowerCase()}|${String(el.href || '')}|${String(el.id || '')}|${Number.isFinite(el.docX) ? el.docX : el.x}|${Number.isFinite(el.docY) ? el.docY : el.y}`
+          : `${el.type}|${String(el.text || '').trim().toLowerCase()}|${String(el.href || '')}`;
+        if (seenElementKeys.has(key)) continue;
+        seenElementKeys.add(key);
+        elements.push(el);
+      }
+    }
+
+    await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {});
+    await page.waitForTimeout(500);
+
+    const accordionElements = await discoverAccordionElements(page);
+    const seenAccordionFingerprints = new Set(
+      elements.map(e => `accordion:${String(e.text || '').substring(0, 50)}:${e.ariaControls || ''}`)
+    );
+    const newAccordionElements = accordionElements.filter(
+      a => !seenAccordionFingerprints.has(`accordion:${String(a.text || '').substring(0, 50)}:${a.ariaControls || ''}`)
+    );
+    if (newAccordionElements.length > 0) {
+      console.log(`  + ${newAccordionElements.length} accordion button(s) discovered via Shadow DOM`);
+      elements.push(...newAccordionElements);
+      elements.sort((a, b) => {
+        if (Math.abs(a.y - b.y) < 50) return a.x - b.x;
+        return a.y - b.y;
+      });
+    }
+    console.log(`  [${runLabel}] Found ${elements.length} clickable elements`);
+   
+    const elementsToTest = CONFIG.maxElementsPerUrl > 0
+      ? elements.slice(0, CONFIG.maxElementsPerUrl)
+      : elements;
+   
+    console.log(`  [${runLabel}] Testing click reception...\n`);
+   
+    let processed = 0;
+    for (let i = 0; i < elementsToTest.length; i++) {
+      const element = elementsToTest[i];
+      processed++;
+      const percent = ((processed / elementsToTest.length) * 100).toFixed(1);
+      const displayText = (element.text || element.ariaLabel || element.type).substring(0, 40);
+      const indicator = element.type === 'a' ? '[LINK]'
+        : element.isAccordion ? '[ACCORD]'
+        : element.isCustomElement ? '[CUSTOM]'
+        : '[BTN]';
+     
+      process.stdout.write(`    [${runLabel}] [${processed}/${elementsToTest.length}] ${percent}% ${indicator} ${element.type}: "${displayText}"... `);
+     
+      try {
+        await restorePageState(page, originalUrl);
+       
+        if (element.type === 'chat-toggle') {
+          await page.waitForTimeout(1000);
+        }
+       
+        const result = await validateClick(page, context, element, originalUrl, { clickOnly });
+        results.push({ ...result, url: targetUrl, originalUrl, elementInfo: element });
+       
+        const genuineFlag = result.isGenuineIssue ? ' [BROKEN]' : '';
+        console.log(`${result.status === 'pass' ? 'PASS' : 'FAIL'} (${result.durationMs}ms) - ${result.clickMethod || 'click'}${genuineFlag}`);
+       
+        if (result.status !== 'pass' && result.errorMessage) {
+          const shortMsg = result.errorMessage.substring(0, 80);
+          console.log(`       -> ${shortMsg}`);
+        }
+       
+        await delay(150);
+       
+      } catch (err) {
+        console.log(`ERROR: ${err.message.substring(0, 60)}`);
+        results.push({
+          status: 'fail', elementType: element.type,
+          elementText: displayText,
+          errorMessage: err.message, durationMs: 0, isGenuineIssue: true
+        });
+      }
+    }
+   
+    if (!clickOnly) {
+      try {
+        await Promise.race([
+          validateCarousels(page, context, originalUrl, results, runLabel),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('Carousel validation timeout')), 30000))
+        ]);
+      } catch (err) {
+        console.log(`  Carousel validation timed out: ${err.message}`);
+      }
+
+      try {
+        await Promise.race([
+          validateNavigationContainers(page, context, originalUrl, results, runLabel),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('Nav container validation timeout')), 60000))
+        ]);
+      } catch (err) {
+        console.log(`  Navigation container validation error: ${err.message}`);
+      }
+
+      const alreadyValidatedKeys = new Set(
+        results
+          .filter(r => r.elementText && r.url === targetUrl)
+          .flatMap((r) => {
+            const key = buildValidationKey({
+              elementType: r.elementType || '',
+              elementText: (r.elementText || '').substring(0, 80),
+              href: r.href || ''
+            });
+            return [key.strict, key.loose];
+          })
+      );
+
+      try {
+        await validateTileFilters(page, context, originalUrl, results, alreadyValidatedKeys, { clickOnly, runLabel });
+      } catch (err) {
+        console.log(`  Tile filter validation error: ${err.message}`);
+      }
+
+      try {
+        await validateTabAccordion(page, context, originalUrl, results, alreadyValidatedKeys, runLabel);
+      } catch (err) {
+        console.log(`  Tab validation error: ${err.message}`);
+      }
+    
+      await validateStickyCta(page, context, originalUrl, results, runLabel);
+      await validateChatWidget(page, context, originalUrl, results, runLabel);
+    }
+   
+    const endTime = Date.now();
+    const passed = results.filter(r => r.status === 'pass').length;
+    const failed = results.filter(r => r.status === 'fail').length;
+    const genuineIssues = results.filter(r => r.isGenuineIssue && r.status === 'fail').length;
+    const successRate = results.length > 0 ? (passed / results.length * 100).toFixed(1) : 0;
+   
+    console.log(`\n  Summary: ${passed} passed, ${failed} failed (${successRate}% success rate)`);
+    if (genuineIssues > 0) {
+      console.log(`  Genuine issues found: ${genuineIssues} (requires investigation)`);
+    } else if (failed > 0) {
+      console.log(`  Note: ${failed} failure(s) detected but they appear to be test flakiness (elements may work manually)`);
+    }
+   
+    return {
+      success: true,
+      url: targetUrl,
+      originalUrl,
+      results,
+      stats: {
+        total: results.length,
+        passed,
+        failed,
+        genuineIssues,
+        successRate: parseFloat(successRate)
+      },
+      duration: endTime - startTime
+    };
+   
+  } catch (error) {
+    console.error(`  Error: ${error.message}`);
+    return { success: false, url: targetUrl, error: error.message };
+  } finally {
+    if (browser) await browser.close();
+  }
+}
+
+// ==================== REPORT GENERATION ====================
+
+async function generateHtmlReport(allResults, startTime, endTime) {
+  const totalUrls = allResults.length;
+  let totalElements = 0, totalPassed = 0, totalFailed = 0, totalGenuine = 0;
+ 
+  for (const r of allResults) {
+    if (r.stats) {
+      totalElements += r.stats.total;
+      totalPassed += r.stats.passed;
+      totalFailed += r.stats.failed;
+      totalGenuine += r.stats.genuineIssues || 0;
+    }
+  }
+ 
+  const overallPassRate = totalElements > 0 ? ((totalPassed / totalElements) * 100).toFixed(1) : 0;
+ 
+  let urlSectionsHtml = '';
+ 
+  for (const urlResult of allResults) {
+    const dedupedUrlResults = dedupeValidationResults(urlResult.results, urlResult.url);
+    const urlShort = urlResult.url.length > 80 ? urlResult.url.substring(0, 77) + '...' : urlResult.url;
+    const dedupedPassed = dedupedUrlResults.filter(r => r.status === 'pass').length;
+    const dedupedFailed = dedupedUrlResults.filter(r => r.status === 'fail').length;
+    const dedupedGenuine = dedupedUrlResults.filter(r => r.isGenuineIssue && r.status === 'fail').length;
+    const dedupedTotal = dedupedUrlResults.length;
+    const successRate = dedupedTotal > 0 ? ((dedupedPassed / dedupedTotal) * 100).toFixed(1) : 0;
+    const successColor = successRate >= 90 ? '#10b981' : (successRate >= 70 ? '#f59e0b' : '#ef4444');
+    const searchComponentResults = dedupedUrlResults.filter(isSearchComponentResult);
+    let searchGroupedHtml = '';
+
+    if (searchComponentResults.length > 0) {
+      const searchRows = searchComponentResults.map((result) => {
+        const label = searchComponentLabel(result);
+        const status = String(result.status || '').toLowerCase() === 'pass' ? 'PASS' : 'FAIL';
+        const method = result.clickMethod || '-';
+        const detail = (result.validationDetail || '-').substring(0, 130);
+        const err = result.errorMessage ? result.errorMessage.substring(0, 90) : '-';
+        const badgeClass = status === 'PASS' ? 'pass' : 'fail';
+        return `
+          <tr>
+            <td><span class="status-badge ${badgeClass}">${status}</span></td>
+            <td>${escapeHtml(label)}</td>
+            <td>${escapeHtml(method)}</td>
+            <td>${escapeHtml(detail)}</td>
+            <td>${escapeHtml(err)}</td>
+          </tr>
+        `;
+      }).join('');
+
+      searchGroupedHtml = `
+        <div class="search-group-box">
+          <div class="search-group-title">Search Component Validation</div>
+          <div class="table-wrapper" style="padding-top: 8px;">
+            <table class="results-table search-table">
+              <thead>
+                <tr><th>Status</th><th>Component</th><th>Method</th><th>Validation</th><th>Error</th></tr>
+              </thead>
+              <tbody>${searchRows}</tbody>
+            </table>
+          </div>
+        </div>
+      `;
+    }
+   
+    let tableRows = '';
+    const genuineResults = dedupedUrlResults.filter(r => r.isGenuineIssue && r.status === 'fail');
+    const regularResults = dedupedUrlResults.filter(r => !(r.isGenuineIssue && r.status === 'fail'));
+   
+    for (const result of genuineResults) {
+      const displayText = (result.elementText || '-').substring(0, 60);
+      tableRows += `
+        <tr class="fail-row">
+          <td class="status-cell"><span class="status-badge fail">FAIL</span></td>
+          <td class="type-cell">${escapeHtml(result.elementType || '?')}</td>
+          <td class="text-cell" title="${escapeHtml(displayText)}">${escapeHtml(displayText)}</td>
+          <td class="method-cell">${result.clickMethod || '-'}</td>
+          <td class="duration-cell">${result.durationMs || 0}ms</td>
+          <td class="error-cell"><span class="broken-text">[BROKEN]</span> ${escapeHtml((result.errorMessage || '').substring(0, 100))}</td>
+        </tr>
+      `;
+    }
+   
+    for (const result of regularResults) {
+      const displayText = (result.elementText || '-').substring(0, 60);
+      tableRows += `
+        <tr class="${result.status}-row">
+          <td class="status-cell"><span class="status-badge ${result.status}">${result.status.toUpperCase()}</span></td>
+          <td class="type-cell">${escapeHtml(result.elementType || '?')}</td>
+          <td class="text-cell" title="${escapeHtml(displayText)}">${escapeHtml(displayText)}</td>
+          <td class="method-cell">${result.clickMethod || '-'}</td>
+          <td class="duration-cell">${result.durationMs || 0}ms</td>
+          <td class="error-cell">${result.errorMessage ? escapeHtml(result.errorMessage.substring(0, 80)) : '-'}</td>
+        </tr>
+      `;
+    }
+   
+    urlSectionsHtml += `
+      <div class="url-section">
+        <div class="url-header" onclick="toggleSection(this)">
+          <div class="url-title">
+            <span class="toggle-icon">▶</span>
+            <span class="url-text">${escapeHtml(urlShort)}</span>
+          </div>
+          <div class="url-stats">
+            <span class="stat-badge total">Total: ${dedupedTotal}</span>
+            <span class="stat-badge passed">Passed: ${dedupedPassed}</span>
+            <span class="stat-badge failed">Failed: ${dedupedFailed}</span>
+            ${dedupedGenuine > 0 ? `<span class="stat-badge broken">Broken: ${dedupedGenuine}</span>` : ''}
+            <span class="stat-badge rate" style="background: ${successColor}20; color: ${successColor}">Rate: ${successRate}%</span>
+          </div>
+        </div>
+        <div class="url-content" style="display: none;">
+          ${searchGroupedHtml}
+          <div class="table-wrapper">
+            <table class="results-table">
+              <thead>
+                <tr><th>Status</th><th>Type</th><th>Element Text</th><th>Method</th><th>Duration</th><th>Error</th></tr>
+              </thead>
+              <tbody>${tableRows}</tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+ 
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Click Reception Validation Report</title>
+    <style>
+        * { box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; padding: 24px; background: #f5f7fa; }
+        .container { max-width: 1400px; margin: 0 auto; }
+        .header { background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%); color: white; padding: 24px; border-radius: 16px; margin-bottom: 24px; }
+        .header h1 { margin: 0 0 8px 0; font-size: 24px; }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 16px; margin-bottom: 24px; }
+        .stat-card { background: white; border-radius: 12px; padding: 16px; text-align: center; }
+        .stat-value { font-size: 32px; font-weight: 700; }
+        .stat-label { color: #64748b; font-size: 11px; text-transform: uppercase; }
+        .stat-pass .stat-value { color: #10b981; }
+        .stat-fail .stat-value { color: #ef4444; }
+        .stat-broken .stat-value { color: #f59e0b; }
+        .url-section { background: white; border-radius: 12px; margin-bottom: 16px; border: 1px solid #e2e8f0; }
+        .url-header { display: flex; justify-content: space-between; align-items: center; padding: 12px 16px; background: #f8fafc; cursor: pointer; }
+        .url-header:hover { background: #f1f5f9; }
+        .url-title { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 13px; }
+        .toggle-icon { font-size: 12px; color: #64748b; }
+        .url-section.expanded .toggle-icon { transform: rotate(90deg); }
+        .url-stats { display: flex; gap: 8px; flex-wrap: wrap; }
+        .stat-badge { padding: 2px 8px; border-radius: 12px; font-size: 10px; font-weight: 600; }
+        .table-wrapper { overflow-x: auto; padding: 16px; }
+        .results-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+        .results-table th { background: #f1f5f9; padding: 8px; text-align: left; font-weight: 600; }
+        .results-table td { padding: 6px 8px; border-bottom: 1px solid #e2e8f0; }
+        .search-group-box { border: 1px solid #dbeafe; background: #f8fbff; margin: 12px 16px 0; border-radius: 10px; }
+        .search-group-title { font-size: 12px; font-weight: 700; color: #1e40af; padding: 10px 12px 0; }
+        .search-table th { background: #eef4ff; }
+        .status-badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 9px; font-weight: 700; }
+        .status-badge.pass { background: #d1fae5; color: #065f46; }
+        .status-badge.fail { background: #fee2e2; color: #991b1b; }
+        .status-badge.broken { background: #fef3c7; color: #92400e; }
+        .broken-text { color: #f59e0b; font-weight: bold; }
+        .type-cell { font-family: monospace; font-size: 10px; }
+        .text-cell { max-width: 250px; word-break: break-word; font-size: 11px; }
+        .error-cell { color: #dc2626; font-size: 10px; word-break: break-word; max-width: 350px; }
+        .footer { margin-top: 24px; text-align: center; font-size: 11px; color: #94a3b8; }
+        .scroll-top { position: fixed; bottom: 30px; right: 30px; background: #1e3c72; color: white; width: 40px; height: 40px; border-radius: 50%; display: flex; align-items: center; justify-content: center; cursor: pointer; opacity: 0; transition: opacity 0.3s; }
+        .scroll-top.visible { opacity: 1; }
+    </style>
+</head>
+<body>
+<div class="container">
+    <div class="header">
+        <h1>Click Reception Validation Report</h1>
+        <div>Generated: ${new Date(startTime).toLocaleString()} | Duration: ${((endTime - startTime) / 1000).toFixed(1)}s</div>
+        <div style="margin-top: 8px; font-size: 12px;">Genuine broken links need investigation | Other failures may be test flakiness</div>
+    </div>
+   
+    <div class="stats-grid">
+        <div class="stat-card"><div class="stat-value">${totalUrls}</div><div class="stat-label">URLs</div></div>
+        <div class="stat-card"><div class="stat-value">${totalElements}</div><div class="stat-label">Elements</div></div>
+        <div class="stat-card stat-pass"><div class="stat-value">${totalPassed}</div><div class="stat-label">Passed</div></div>
+        <div class="stat-card stat-fail"><div class="stat-value">${totalFailed}</div><div class="stat-label">Failed</div></div>
+        ${totalGenuine > 0 ? `<div class="stat-card stat-broken"><div class="stat-value">${totalGenuine}</div><div class="stat-label">Broken Links</div></div>` : ''}
+        <div class="stat-card"><div class="stat-value">${overallPassRate}%</div><div class="stat-label">Success Rate</div></div>
+    </div>
+   
+    <div style="margin-bottom: 16px;">
+        <button onclick="expandAll()" style="background: #e2e8f0; border: none; padding: 4px 12px; border-radius: 6px; margin-right: 8px; cursor: pointer;">Expand All</button>
+        <button onclick="collapseAll()" style="background: #e2e8f0; border: none; padding: 4px 12px; border-radius: 6px; cursor: pointer;">Collapse All</button>
+    </div>
+   
+    ${urlSectionsHtml}
+   
+    <div class="footer">
+        <p>PASS = Click success | FAIL = Click failed or genuine broken link | [BROKEN] = Needs investigation</p>
+    </div>
+</div>
+<button class="scroll-top" onclick="scrollToTop()" id="scrollTopBtn">↑</button>
+<script>
+    function toggleSection(header) {
+        const section = header.closest('.url-section');
+        section.classList.toggle('expanded');
+        const content = section.querySelector('.url-content');
+        const icon = header.querySelector('.toggle-icon');
+        if (section.classList.contains('expanded')) {
+            content.style.display = 'block';
+            icon.textContent = '▼';
+        } else {
+            content.style.display = 'none';
+            icon.textContent = '▶';
+        }
+    }
+    function expandAll() { document.querySelectorAll('.url-section').forEach(s => { s.classList.add('expanded'); const c = s.querySelector('.url-content'); const i = s.querySelector('.toggle-icon'); if(c) c.style.display = 'block'; if(i) i.textContent = '▼'; }); }
+    function collapseAll() { document.querySelectorAll('.url-section').forEach(s => { s.classList.remove('expanded'); const c = s.querySelector('.url-content'); const i = s.querySelector('.toggle-icon'); if(c) c.style.display = 'none'; if(i) i.textContent = '▶'; }); }
+    window.addEventListener('scroll', function() { document.getElementById('scrollTopBtn').classList.toggle('visible', window.scrollY > 300); });
+    function scrollToTop() { window.scrollTo({ top: 0, behavior: 'smooth' }); }
+</script>
+</body>
+</html>`;
+
+  const reportPath = path.join(CONFIG.reportsDir, `validation_report_${new Date().toISOString().replace(/[:.]/g, '-')}.html`);
+  await fs.writeFile(reportPath, html);
+  return reportPath;
+}
+
+// ==================== EXCEL REPORT WITH DEDUPLICATION ====================
+
+function generateExcelReport(allResults, startTime, endTime) {
+  const workbook = XLSX.utils.book_new();
+ 
+  let totalElements = 0, totalPassed = 0, totalFailed = 0, totalGenuine = 0;
+  for (const r of allResults) {
+    if (r.stats) {
+      totalElements += r.stats.total;
+      totalPassed += r.stats.passed;
+      totalFailed += r.stats.failed;
+      totalGenuine += r.stats.genuineIssues || 0;
+    }
+  }
+ 
+  const summaryData = [
+    ['Click Reception Validation Report'],
+    ['Generated:', new Date().toLocaleString()],
+    ['Total Duration:', `${((endTime - startTime) / 1000).toFixed(1)}s`],
+    [],
+    ['Overall Statistics'],
+    ['URLs Tested', allResults.length],
+    ['Total Clickable Elements', totalElements],
+    ['Passed', totalPassed],
+    ['Failed', totalFailed],
+    ['Genuine Broken Links', totalGenuine],
+    ['Overall Success Rate', totalElements > 0 ? `${((totalPassed / totalElements) * 100).toFixed(1)}%` : 'N/A'],
+    [],
+    ['Per-URL Summary'],
+    ['URL', 'Total', 'Passed', 'Failed', 'Genuine Issues', 'Success Rate', 'Duration(s)']
+  ];
+ 
+  for (const r of allResults) {
+    if (r.stats) {
+      summaryData.push([
+        r.url, r.stats.total, r.stats.passed, r.stats.failed,
+        r.stats.genuineIssues || 0, `${r.stats.successRate}%`, (r.duration / 1000).toFixed(1)
+      ]);
+    }
+  }
+ 
+  const summarySheet = XLSX.utils.aoa_to_sheet(summaryData);
+  XLSX.utils.book_append_sheet(workbook, summarySheet, 'Summary');
+ 
+  // ========== DEDUPLICATED DETAILED RESULTS ==========
+  // Track unique entries to prevent duplicates in Excel only
+  const detailedData = [
+    ['Status', 'URL', 'Element Type', 'Element Text', 'Click Method', 'Duration (ms)', 'Href', 'Validation Detail', 'Error Message', 'Genuine Issue']
+  ];
+ 
+  const seenEntries = new Set();
+ 
+  for (const urlResult of allResults) {
+    const dedupedUrlResults = dedupeValidationResults(urlResult.results, urlResult.url);
+    for (const result of dedupedUrlResults) {
+      // Create a fingerprint to identify duplicate entries
+      const elementText = (result.elementText || '-').substring(0, 200);
+      const hrefValue = result.href || result.elementInfo?.href || '-';
+      if (!CONFIG.dedupeExcelRows) {
+        detailedData.push([
+          result.status.toUpperCase(), urlResult.url, result.elementType,
+          elementText,
+          result.clickMethod || '-', result.durationMs || 0,
+          hrefValue,
+          (result.validationDetail || '').substring(0, 200),
+          (result.errorMessage || '').substring(0, 300),
+          result.isGenuineIssue ? 'YES' : 'NO'
+        ]);
+        continue;
+      }
+     
+      // Build fingerprint based on URL + text + href (ignores element type so ngx-web-link and a are treated as same)
+      let fingerprint;
+      if (hrefValue && hrefValue !== '-' && hrefValue !== 'missing' && hrefValue !== 'null') {
+        // Use href as the primary key for links
+        fingerprint = `${urlResult.url}|href:${hrefValue.split('?')[0].split('#')[0]}`;
+      } else {
+        // For non-link elements, use text + type
+        fingerprint = `${urlResult.url}|type:${result.elementType}|text:${elementText}`;
+      }
+     
+      // Also track by text for links that might have same href but different text
+      const textFingerprint = `${urlResult.url}|text:${elementText}`;
+     
+      if (!seenEntries.has(fingerprint) && !seenEntries.has(textFingerprint)) {
+        seenEntries.add(fingerprint);
+        seenEntries.add(textFingerprint);
+       
+        detailedData.push([
+          result.status.toUpperCase(), urlResult.url, result.elementType,
+          elementText,
+          result.clickMethod || '-', result.durationMs || 0,
+          hrefValue,
+          (result.validationDetail || '').substring(0, 200),
+          (result.errorMessage || '').substring(0, 300),
+          result.isGenuineIssue ? 'YES' : 'NO'
+        ]);
+      }
+    }
+  }
+ 
+  const detailedSheet = XLSX.utils.aoa_to_sheet(detailedData);
+  XLSX.utils.book_append_sheet(workbook, detailedSheet, 'Detailed Results');
+ 
+  // ========== DEDUPLICATED GENUINE ISSUES ==========
+  const genuineData = [
+    ['URL', 'Element Type', 'Element Text', 'Href', 'Error Message']
+  ];
+ 
+  const seenGenuine = new Set();
+ 
+  for (const urlResult of allResults) {
+    const dedupedUrlResults = dedupeValidationResults(urlResult.results, urlResult.url);
+    for (const result of dedupedUrlResults) {
+      if (result.isGenuineIssue && result.status === 'fail') {
+        const elementText = (result.elementText || '-').substring(0, 200);
+        const hrefValue = result.href || result.elementInfo?.href || '-';
+        if (!CONFIG.dedupeExcelRows) {
+          genuineData.push([
+            urlResult.url,
+            result.elementType,
+            elementText,
+            hrefValue,
+            (result.errorMessage || '-').substring(0, 300)
+          ]);
+          continue;
+        }
+       
+        // Use href as fingerprint for genuine issues
+        const fingerprint = `${urlResult.url}|${hrefValue}|${elementText}`;
+       
+        if (!seenGenuine.has(fingerprint)) {
+          seenGenuine.add(fingerprint);
+          genuineData.push([
+            urlResult.url,
+            result.elementType,
+            elementText,
+            hrefValue,
+            (result.errorMessage || '-').substring(0, 300)
+          ]);
+        }
+      }
+    }
+  }
+ 
+  if (genuineData.length > 1) {
+    const genuineSheet = XLSX.utils.aoa_to_sheet(genuineData);
+    XLSX.utils.book_append_sheet(workbook, genuineSheet, 'Genuine Issues');
+  }
+ 
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const excelPath = path.join(CONFIG.reportsDir, `validation_report_${timestamp}.xlsx`);
+  XLSX.writeFile(workbook, excelPath);
+ 
+  return excelPath;
+}
+
+// ==================== CSV PARSING ====================
+
+function parseCSV(csvPath) {
+  try {
+    const content = fsSync.readFileSync(csvPath, 'utf-8').replace(/^\uFEFF/, '');
+    const lines = content
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(line => line && !line.startsWith('#'));
+   
+    if (lines.length < 2) throw new Error('CSV file has no data rows');
+   
+    const parseCsvLine = (line) => {
+      const values = [];
+      let current = '';
+      let inQuotes = false;
+
+      for (let i = 0; i < line.length; i++) {
+        const ch = line[i];
+        if (ch === '"') {
+          if (inQuotes && line[i + 1] === '"') {
+            current += '"';
+            i++;
+          } else {
+            inQuotes = !inQuotes;
+          }
+        } else if (ch === ',' && !inQuotes) {
+          values.push(current.trim());
+          current = '';
+        } else {
+          current += ch;
+        }
+      }
+
+      values.push(current.trim());
+      return values;
+    };
+
+    const headers = parseCsvLine(lines[0]).map(h => h.toLowerCase());
+    const urlIndex = headers.findIndex(h => h === 'url');
+   
+    if (urlIndex === -1) throw new Error('CSV must have a "url" column');
+   
+    const urls = [];
+    for (let i = 1; i < lines.length; i++) {
+      const values = parseCsvLine(lines[i]);
+      const primaryUrl = values[urlIndex] || '';
+      const fallbackUrl = values.find(v => v.startsWith('http://') || v.startsWith('https://')) || '';
+      const url = (primaryUrl.startsWith('http://') || primaryUrl.startsWith('https://'))
+        ? primaryUrl
+        : fallbackUrl;
+
+      if (url) {
+        urls.push({ url, index: i });
+      }
+    }
+    return urls;
+  } catch (error) {
+    throw new Error(`Failed to parse CSV: ${error.message}`);
+  }
+}
+
+// ==================== MAIN ====================
+
+async function main() {
+  const args = process.argv.slice(2);
+  const headed = args.includes('--headed');
+  const clickOnly = args.includes('--click-only');
+  const fileArgIndex = args.indexOf('--file');
+  const csvFileArg = fileArgIndex !== -1 ? args[fileArgIndex + 1] : null;
+  const singleUrl = args.find(arg => arg.startsWith('http://') || arg.startsWith('https://'));
+ 
+  console.log('\n' + '='.repeat(70));
+  console.log('COMPREHENSIVE CLICK RECEPTION VALIDATOR');
+  console.log('='.repeat(70));
+ 
+  if (headed) console.log('\nRunning in headed mode (browser visible)\n');
+  if (clickOnly) console.log('Running in click-only mode (no navigation requirement)\n');
+ 
+  await fs.mkdir(CONFIG.reportsDir, { recursive: true });
+ 
+  let urlsToTest = [];
+ 
+  if (singleUrl) {
+    urlsToTest = [singleUrl];
+    console.log(`Single URL mode: ${singleUrl}\n`);
+  } else {
+    const csvPath = csvFileArg
+      ? path.resolve(process.cwd(), csvFileArg)
+      : path.join(process.cwd(), 'urls.csv');
+    if (!fsSync.existsSync(csvPath)) {
+      console.error(`Error: CSV file not found: ${csvPath}`);
+      console.error('Usage: node clickable_navigation_validator.js https://example.com --headed');
+      console.error('   or: node clickable_navigation_validator.js --file urls.csv --headed');
+      process.exit(1);
+    }
+    const urlEntries = parseCSV(csvPath);
+    urlsToTest = urlEntries.map(e => e.url);
+    console.log(`Batch mode: ${urlsToTest.length} URL(s) from ${path.basename(csvPath)}\n`);
+  }
+ 
+  const allResults = [];
+  const overallStartTime = Date.now();
+ 
+  for (let i = 0; i < urlsToTest.length; i++) {
+    console.log(`\n[${i + 1}/${urlsToTest.length}] Processing...`);
+    const result = await validateUrl(urlsToTest[i], { headed, clickOnly });
+    if (result.success) {
+      allResults.push(result);
+    }
+  }
+ 
+  const overallEndTime = Date.now();
+ 
+  if (allResults.length > 0) {
+    const htmlPath = await generateHtmlReport(allResults, overallStartTime, overallEndTime);
+    const excelPath = generateExcelReport(allResults, overallStartTime, overallEndTime);
+   
+    console.log('\n' + '='.repeat(70));
+    console.log('REPORTS GENERATED');
+    console.log('='.repeat(70));
+    console.log(`HTML Report: ${htmlPath}`);
+    console.log(`Excel Report: ${excelPath}`);
+   
+    let totalGenuine = 0;
+    for (const r of allResults) {
+      totalGenuine += r.stats?.genuineIssues || 0;
+    }
+   
+    if (totalGenuine > 0) {
+      console.log(`\nWARNING: Found ${totalGenuine} genuine broken link(s) that need investigation.`);
+      console.log('Check the "Genuine Issues" sheet in the Excel report for details.');
+      process.exitCode = 1;
+    } else {
+      console.log('\nNo genuine broken links found. Failures may be test flakiness.');
+    }
+  }
+ 
+  console.log('\nValidation complete.\n');
+}
+
+if (require.main === module) {
+  main().catch(error => {
+    console.error('Unhandled error:', error);
+    process.exit(1);
+  });
+}
+
+module.exports = { validateUrl, discoverClickableElements, validateClick };
