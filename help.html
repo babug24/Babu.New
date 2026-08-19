@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>NVDA Test Automation - Help</title>
+<style>
+  body { font-family: Segoe UI, Arial, sans-serif; max-width: 900px; margin: 0 auto; padding: 24px; line-height: 1.6; color: #1b1b1b; }
+  h1 { color: #0b5fff; border-bottom: 3px solid #0b5fff; padding-bottom: 8px; }
+  h2 { color: #0b5fff; margin-top: 32px; border-bottom: 1px solid #ddd; padding-bottom: 4px; }
+  h3 { margin-top: 20px; }
+  code, pre { background: #f4f4f4; border-radius: 4px; font-family: Consolas, monospace; }
+  code { padding: 2px 6px; }
+  pre { padding: 12px; overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+  th, td { border: 1px solid #ddd; padding: 8px 10px; text-align: left; vertical-align: top; }
+  th { background: #0b5fff; color: #fff; }
+  tr:nth-child(even) { background: #f9f9f9; }
+  .nav { background: #f4f4f4; padding: 14px; border-radius: 6px; margin-bottom: 24px; }
+  .nav a { margin-right: 14px; }
+  .tag-pass { color: #1a7f37; font-weight: bold; }
+  .tag-fail { color: #d1242f; font-weight: bold; }
+  .note { background: #fff8e1; border-left: 4px solid #f2b600; padding: 10px 14px; margin: 12px 0; }
+</style>
+</head>
+<body>
+
+<h1>NVDA Test Automation - Help</h1>
+<p>Automated accessibility testing tool that drives NVDA (NonVisual Desktop Access) and a Chromium browser to verify page content, headings, landmarks, focusable elements, images, ARIA labels, form controls and dynamic content across a list of URLs.</p>
+
+<div class="nav">
+  <strong>Contents:</strong>
+  <a href="#overview">Overview</a>
+  <a href="#requirements">Requirements</a>
+  <a href="#setup">Setup</a>
+  <a href="#csv">urls.csv Format</a>
+  <a href="#running">Running Tests</a>
+  <a href="#tests">What Gets Tested</a>
+  <a href="#config">Configuration</a>
+  <a href="#reports">Reports &amp; Output</a>
+  <a href="#troubleshooting">Troubleshooting</a>
+</div>
+
+<h2 id="overview">Overview</h2>
+<p>This tool reads a list of page URLs from <code>urls.csv</code>, opens each page in a visible Chromium browser via Playwright, starts NVDA, and runs a series of accessibility checks (content, headings, landmarks, focus order, images/alt text, ARIA labels, forms, dynamic content). Results are collected and exported as HTML and Excel reports, with screenshots captured for each page.</p>
+
+<h2 id="requirements">Requirements</h2>
+<ul>
+  <li><strong>OS:</strong> Windows (NVDA is a Windows-only screen reader)</li>
+  <li><strong>NVDA</strong> installed and available on the system</li>
+  <li><strong>Node.js</strong> (with npm)</li>
+  <li>Project dependencies installed (see Setup below)</li>
+</ul>
+
+<h2 id="setup">Setup</h2>
+<pre>cd nvda-test-automation
+npm install</pre>
+<p>This installs: <code>@guidepup/guidepup</code> (NVDA driver), <code>playwright</code> (browser automation), <code>fs-extra</code>, <code>csv-parser</code>, <code>xlsx</code>, <code>chalk</code>, <code>ora</code>.</p>
+<div class="note">Playwright may require its browser binaries. If Chromium isn't already installed, run <code>npx playwright install chromium</code>.</div>
+
+<h2 id="csv">urls.csv Format</h2>
+<p>Create/edit <code>urls.csv</code> in the project root with a header row containing a URL column. Accepted header names (case-insensitive): <code>url</code>, <code>website</code>, <code>link</code>, <code>page</code>, or <code>website url</code>.</p>
+<pre>url
+https://example.com/page-one/
+https://example.com/page-two/
+www.example.com/page-three/</pre>
+<p>URLs without a protocol are automatically prefixed with <code>https://</code>. Invalid URLs are skipped with a warning, not a failure.</p>
+
+<h2 id="running">Running Tests</h2>
+<pre>npm test</pre>
+<p>or directly:</p>
+<pre>node nvda-test-automation.js</pre>
+<p>The Chromium browser opens visibly for each page (headless mode is <code>true</code> for NVDA/Playwright internals but the visibility config forces the browser window to be shown). If <code>debug.enabled</code> is <code>true</code> in the config, the script pauses after each page and waits for you to press <strong>Enter</strong> before continuing to the next URL.</p>
+
+<h2 id="tests">What Gets Tested (per page)</h2>
+<table>
+  <tr><th>Test</th><th>Purpose</th></tr>
+  <tr><td>Content Reading</td><td>Confirms the page has meaningful text content (&gt;100 characters) and a title.</td></tr>
+  <tr><td>Heading Navigation</td><td>Verifies headings (<code>h1</code>-<code>h6</code>, <code>role="heading"</code>) exist and form a sensible structure.</td></tr>
+  <tr><td>Landmark Navigation</td><td>Checks for ARIA/HTML landmarks (header, nav, main, footer, etc.).</td></tr>
+  <tr><td>Focusable Elements</td><td>Validates interactive elements (links, buttons, inputs) can receive keyboard focus.</td></tr>
+  <tr><td>Images</td><td>Detects broken images and checks for missing/empty <code>alt</code> text, skipping known decorative/tracking patterns.</td></tr>
+  <tr><td>ARIA Labels</td><td>Confirms interactive elements have accessible names via ARIA attributes.</td></tr>
+  <tr><td>Form Controls</td><td>Checks form inputs have associated labels.</td></tr>
+  <tr><td>Dynamic Content</td><td>Checks for live regions / dynamically updated content handling.</td></tr>
+</table>
+<p>A page is marked <span class="tag-pass">PASS</span> only if all of its tests pass; otherwise it is marked <span class="tag-fail">FAIL</span>.</p>
+
+<h2 id="config">Configuration</h2>
+<p>All settings live in the <code>CONFIG</code> object at the top of <code>nvda-test-automation.js</code>:</p>
+<table>
+  <tr><th>Key</th><th>Description</th></tr>
+  <tr><td><code>csvPath</code></td><td>Path to the input CSV file (default <code>./urls.csv</code>)</td></tr>
+  <tr><td><code>reportsDir</code></td><td>Base folder for generated reports/screenshots (default <code>./reports</code>)</td></tr>
+  <tr><td><code>timeout</code> / <code>navigationTimeout</code> / <code>speechTimeout</code> / <code>nvdaStartTimeout</code></td><td>Timeouts (ms) for various operations</td></tr>
+  <tr><td><code>retryAttempts</code></td><td>Number of retries for a failed page test</td></tr>
+  <tr><td><code>visibility.*</code></td><td>Controls forcing the browser/page to be visible, waiting for render/images, and taking screenshots</td></tr>
+  <tr><td><code>stealth.*</code></td><td>Anti-bot-detection options: realistic user agent, randomized viewport, human-like delays/mouse movement, cookie acceptance</td></tr>
+  <tr><td><code>images.decorativePatterns</code> / <code>images.skipPatterns</code></td><td>Filename patterns to treat as decorative or skip entirely during image checks</td></tr>
+  <tr><td><code>debug.enabled</code> / <code>debug.pauseOnFinish</code></td><td>Pause and keep the browser open after each test until Enter is pressed</td></tr>
+</table>
+
+<h2 id="reports">Reports &amp; Output</h2>
+<p>After a run, results are written under <code>reports/</code>:</p>
+<ul>
+  <li><code>reports/html/test-report-&lt;timestamp&gt;.html</code> - human-readable HTML report with pass/fail summary per page and per test</li>
+  <li><code>reports/excel/</code> - Excel (<code>.xlsx</code>) export of the same results for spreadsheet analysis</li>
+  <li><code>reports/screenshots/</code> - screenshot captured for each tested page</li>
+</ul>
+<p>Console output also shows a live summary (pages found, invalid URLs skipped, pass/fail per test) using colorized output.</p>
+
+<h2 id="troubleshooting">Troubleshooting</h2>
+<ul>
+  <li><strong>"No URLs found in CSV"</strong>: Ensure <code>urls.csv</code> exists and has a <code>url</code> (or accepted alias) header column with at least one row.</li>
+  <li><strong>Browser doesn't appear</strong>: Confirm <code>visibility.showBrowser</code> / <code>forceVisible</code> are <code>true</code> in <code>CONFIG</code>.</li>
+  <li><strong>NVDA doesn't start</strong>: Make sure NVDA is installed and not already blocked by another running instance; increase <code>nvdaStartTimeout</code> if needed.</li>
+  <li><strong>Script seems to hang between pages</strong>: This is expected if <code>debug.enabled</code> is <code>true</code> — press Enter in the terminal to continue.</li>
+  <li><strong>Invalid URLs skipped</strong>: Check the console warning list; fix or remove entries in <code>urls.csv</code>.</li>
+</ul>
+
+</body>
+</html>
